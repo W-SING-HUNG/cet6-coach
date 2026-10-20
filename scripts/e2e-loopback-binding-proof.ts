@@ -1,0 +1,488 @@
+#!/usr/bin/env node
+/**
+ * 本地回环绑定与**同源一致性**的运行时证明（P0-1 / P0-2）。
+ *
+ * ── 它证明什么 ──
+ *
+ * 1. **回环绑定**：源码里写 `-H 127.0.0.1` 不等于服务真的只监听回环。
+ *    因此这里起**真实**的 Next 服务器，然后从操作系统问它是否真的在
+ *    回环上接受连接、并拒绝非回环 Host。
+ * 2. **`pnpm dev` 与 `pnpm start` 都可用**：上一轮发现 `start` 没写端口，
+ *    于是它默认监听 3000，而 `CET6_LOCAL_ORIGIN` 默认 3100 ——
+ *    生产实例会被自己的守卫挡掉。这里对**两条命令**各起一次真实服务，
+ *    验证 GET 导航与授权揭示都能工作、跨来源请求失败。
+ *
+ * 判据是 `server.address()` / 真实 HTTP 响应的**实际取值**，不是回显常量 ——
+ * 回显的写法在绑定被改成 `0.0.0.0` 之后仍然显示 `127.0.0.1`，
+ * 因此证明不了任何事（同标注服务器 F7 的理由）。
+ *
+ * ── 它用的是什么数据 ──
+ *
+ * **只用合成夹具**：内容根与数据库都在 `.e2e/` 下。
+ * 它**不碰** `private-content/`，也不碰日常开发库，更**不运行** `e2e:real`。
+ */
+
+import { createConnection } from "node:net";
+import { request as httpRequest } from "node:http";
+import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
+import {
+  E2E_LOOPBACK_PROOF_PORT,
+  E2E_LOOPBACK_PROOF_DEV_PORT,
+  E2E_LOOPBACK_PROOF_DB_PATH,
+  E2E_LOOPBACK_PROOF_CONTENT_ROOT,
+} from "../e2e/config";
+import { LOOPBACK_HOST } from "@/lib/loopback-guard";
+import { telemetryOffEnv } from "./next.mjs";
+
+let passed = 0;
+let failed = 0;
+
+function check(label: string, condition: boolean, detail = ""): void {
+  if (condition) {
+    passed += 1;
+    console.log(`  ✓ ${label}`);
+  } else {
+    failed += 1;
+    console.log(`  ✗ ${label}${detail === "" ? "" : `（${detail}）`}`);
+  }
+}
+
+/** 从本机连一下某个地址，判断它是否在接受连接。 */
+function canConnect(host: string, port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = createConnection({ host, port });
+    const done = (result: boolean) => {
+      socket.destroy();
+      resolve(result);
+    };
+    socket.setTimeout(3000);
+    socket.once("connect", () => done(true));
+    socket.once("timeout", () => done(false));
+    socket.once("error", () => done(false));
+  });
+}
+
+/**
+ * 发一个**原始 HTTP** 请求（允许任意 Host）。
+ *
+ * `Host` 与 `Origin` 都是 Fetch 规范的禁止修改请求头：Node 的 `fetch`
+ * 与浏览器都会静默丢弃脚本设的值。因此这条判据必须用底层 `node:http`
+ * （同标注服务器的非回环 Host 判据）。
+ */
+function rawGet(
+  port: number,
+  path: string,
+  hostHeader: string,
+): Promise<{ status: number; cacheControl: string | null }> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      { host: LOOPBACK_HOST, port, path, method: "GET", headers: { host: hostHeader } },
+      (res) => {
+        res.on("data", () => {
+          // 判据是状态码与响应头，不是内容 —— 因此丢弃 body。
+        });
+        res.on("end", () =>
+          resolve({
+            status: res.statusCode ?? 0,
+            cacheControl: (res.headers["cache-control"] as string | undefined) ?? null,
+          }),
+        );
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+/**
+ * 发一个**原始 HTTP** POST 请求（允许任意 `Host` 与 `Origin`）。
+ *
+ * 同 `rawGet` 的理由：这两个头都是禁止修改的请求头，只有底层
+ * `node:http` 能真的把它们带上去。
+ */
+function rawPost(
+  port: number,
+  path: string,
+  options: { hostHeader: string; originHeader?: string; body: string },
+): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const payload = Buffer.from(options.body, "utf8");
+    const headers: Record<string, string> = {
+      host: options.hostHeader,
+      "content-type": "application/json",
+      "content-length": String(payload.byteLength),
+    };
+    if (options.originHeader !== undefined) headers.origin = options.originHeader;
+
+    const req = httpRequest(
+      { host: LOOPBACK_HOST, port, path, method: "POST", headers },
+      (res) => {
+        let body = "";
+        res.on("data", (chunk: Buffer) => {
+          body += chunk.toString("utf8");
+        });
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+      },
+    );
+    req.on("error", reject);
+    req.write(payload);
+    req.end();
+  });
+}
+
+/** 等某个端口就绪（最多 90 秒，dev 首次编译可能较慢）。 */
+async function waitForPort(port: number, timeoutSeconds = 90): Promise<boolean> {
+  for (let attempt = 0; attempt < timeoutSeconds; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    if (await canConnect(LOOPBACK_HOST, port)) return true;
+  }
+  return false;
+}
+
+/**
+ * 读回页面 HTML（回环 Host），用于核对页面上的风险指纹。
+ *
+ * 判据是 `data-risk-fingerprint` 属性的**实际取值** —— 那是服务端渲染
+ * 出来的，而不是在证明里重算的常量。
+ */
+function fetchPageHtml(port: number, path: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      {
+        host: LOOPBACK_HOST,
+        port,
+        path,
+        method: "GET",
+        headers: { host: `${LOOPBACK_HOST}:${port}` },
+      },
+      (res) => {
+        let body = "";
+        res.on("data", (chunk: Buffer) => {
+          body += chunk.toString("utf8");
+        });
+        res.on("end", () => resolve(body));
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+/** 从页面 HTML 里读出风险指纹（读不到返回 null）。 */
+function fingerprintFromHtml(html: string): string | null {
+  const match = /data-risk-fingerprint="([0-9a-f]{64})"/.exec(html);
+  return match ? match[1] : null;
+}
+
+/** 起一个真实服务器并返回其子进程。 */
+function startServer(command: "dev" | "start", port: number): ChildProcess {
+  /*
+   * 走仓库的 Next 入口（`scripts/next.mjs`）而不是裸 `pnpm exec next`：
+   * 那样才会带上 `NEXT_TELEMETRY_DISABLED`（本轮 P1-T）。
+   *
+   * 这一条同时被架构门禁守着：任何启动器若绕过统一入口，
+   * 就构成一个遥测旁路 —— 而这正是独立审查要求审计的东西。
+   */
+  return spawn(
+    process.execPath,
+    ["scripts/next.mjs", command, "-H", LOOPBACK_HOST, "-p", String(port)],
+    {
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        ...telemetryOffEnv(),
+        CET6_DB_PATH: E2E_LOOPBACK_PROOF_DB_PATH,
+        /*
+         * 只覆盖端口：`CET6_LOCAL_ORIGIN` 的协议与主机名仍走默认值。
+         * 这同时验证了 `PORT` 环境变量这条取值路径（P0-2 第 2 条）。
+         */
+        PORT: String(port),
+      },
+    },
+  );
+}
+
+/** 结束一个服务器：先杀外壳，再按端口找进程，最后硬超时兜底。 */
+async function stopServer(child: ChildProcess, port: number): Promise<void> {
+  try {
+    child.kill();
+  } catch {
+    /* 已经退了 */
+  }
+  try {
+    execSync(
+      `powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }"`,
+      { stdio: "ignore" },
+    );
+  } catch {
+    /* 端口上已经没有进程了 */
+  }
+}
+
+/** 对一个实例跑完整的安全判据。 */
+async function verifyInstance(label: string, port: number, probe: RevealProbe): Promise<void> {
+  console.log(`\n── ${label}（端口 ${port}）──`);
+
+  // ① 回环可连（否则后面几条没有意义）。
+  check("127.0.0.1 可连", await canConnect(LOOPBACK_HOST, port));
+
+  /*
+   * ② 集中边界：非回环 Host 的 HTTP 请求必须被拒。
+   *
+   * 这是"没有绑到 0.0.0.0 / 局域网地址"的运行时判据 ——
+   * 若服务绑在 `0.0.0.0`，那么带任意 Host 的请求都会被受理。
+   */
+  const foreignHost = await rawGet(port, "/practice/courses", "evil.example");
+  check(
+    "非回环 Host ⇒ 被集中边界拒绝",
+    foreignHost.status === 421 || foreignHost.status === 403,
+    `状态 ${foreignHost.status}`,
+  );
+
+  // ②b 局域网 Host 同样被拒。
+  const lanHost = await rawGet(port, "/practice/courses", "192.168.1.5:8080");
+  check(
+    "局域网 Host ⇒ 被集中边界拒绝",
+    lanHost.status === 421 || lanHost.status === 403,
+    `状态 ${lanHost.status}`,
+  );
+
+  // ②c 敏感 POST 端点也要过这道边界（纵深防御）。
+  const foreignApi = await rawGet(port, "/api/course/reveal", "evil.example");
+  check(
+    "非回环 Host 打敏感端点 ⇒ 被拒",
+    foreignApi.status === 421 || foreignApi.status === 403,
+    `状态 ${foreignApi.status}`,
+  );
+
+  // ③ 回环 Host 的正常请求可以到达（否则守卫过严会让产品不可用）。
+  const loopback = await rawGet(port, "/practice/courses", `${LOOPBACK_HOST}:${port}`);
+  check(
+    "回环 Host ⇒ GET 导航正常放行",
+    loopback.status < 500,
+    `状态 ${loopback.status}`,
+  );
+
+  // ④ 被拒的响应不得带缓存（拒绝信息也不该被中间层留住）。
+  check(
+    "拒绝响应的 cache-control 是 no-store",
+    foreignHost.cacheControl === "no-store",
+    foreignHost.cacheControl ?? "无",
+  );
+
+  /*
+   * ── ⑤ 同源一致性（P0-2 的核心）──
+   *
+   * 这几条一起证明"可信来源与实例实际监听的端口一致"：
+   * 上一轮 `start` 没写端口（默认 3000），而默认可信来源是 3100 ——
+   * 于是生产实例会把自己的合法请求全部拒掉。判据必须同时覆盖
+   * **放行**与**拒绝**两个方向，否则"全部拒绝"也会被误判为通过。
+   *
+   * 指纹从**真实渲染出来的页面**读回，而不是在证明里重算 ——
+   * 那才能证明"页面给出的指纹"与"服务端接受的指纹"是同一个。
+   */
+  const html = await fetchPageHtml(
+    port,
+    `/practice/courses/${probe.courseId}`,
+  );
+  const servedFingerprint = fingerprintFromHtml(html);
+  check(
+    "课程页渲染出风险指纹（页面与端点共用同一份事实）",
+    servedFingerprint !== null,
+  );
+
+  if (servedFingerprint !== null) {
+    const sameOrigin = await rawPost(port, "/api/course/reveal", {
+      hostHeader: `${LOOPBACK_HOST}:${port}`,
+      originHeader: `http://${LOOPBACK_HOST}:${port}`,
+      body: JSON.stringify({
+        courseId: probe.courseId,
+        segmentId: probe.segmentId,
+        courseContentVersion: 1,
+        confirmedRiskFingerprint: servedFingerprint,
+      }),
+    });
+    check(
+      "同源 POST ⇒ 授权揭示成功（200 + 正文）",
+      sameOrigin.status === 200 && sameOrigin.body.includes(probe.expectedText),
+      `状态 ${sameOrigin.status}`,
+    );
+
+    /*
+     * 用页面指纹走通之后，同一个指纹再打一次必须是幂等成功
+     * （不是第二次被拒）—— 证明风险重确认不会把重试变成错误。
+     */
+    const retry = await rawPost(port, "/api/course/reveal", {
+      hostHeader: `${LOOPBACK_HOST}:${port}`,
+      originHeader: `http://${LOOPBACK_HOST}:${port}`,
+      body: JSON.stringify({
+        courseId: probe.courseId,
+        segmentId: probe.segmentId,
+        courseContentVersion: 1,
+        confirmedRiskFingerprint: servedFingerprint,
+      }),
+    });
+    check(
+      "同源重复 POST ⇒ 200 且幂等（不因重确认而失败）",
+      retry.status === 200,
+      `状态 ${retry.status}`,
+    );
+
+    // ⑤b 跨来源（同主机不同端口）必须失败 —— 证明"都是回环"不等于同源。
+    const otherPort = port === E2E_LOOPBACK_PROOF_PORT ? E2E_LOOPBACK_PROOF_DEV_PORT : E2E_LOOPBACK_PROOF_PORT;
+    const crossPort = await rawPost(port, "/api/course/reveal", {
+      hostHeader: `${LOOPBACK_HOST}:${port}`,
+      originHeader: `http://${LOOPBACK_HOST}:${otherPort}`,
+      body: JSON.stringify({
+        courseId: probe.courseId,
+        segmentId: probe.segmentId,
+        courseContentVersion: 1,
+        confirmedRiskFingerprint: servedFingerprint,
+      }),
+    });
+    check(
+      "不同回环端口 Origin ⇒ 403（回环 ≠ 同源）",
+      crossPort.status === 403,
+      `状态 ${crossPort.status}`,
+    );
+    check("跨来源响应不含正文", !crossPort.body.includes(probe.expectedText));
+
+    // ⑤c 跨站 Origin 必须失败。
+    const crossSite = await rawPost(port, "/api/course/reveal", {
+      hostHeader: `${LOOPBACK_HOST}:${port}`,
+      originHeader: "https://evil.example",
+      body: JSON.stringify({
+        courseId: probe.courseId,
+        segmentId: probe.segmentId,
+        courseContentVersion: 1,
+        confirmedRiskFingerprint: servedFingerprint,
+      }),
+    });
+    check("跨站 Origin ⇒ 403", crossSite.status === 403, `状态 ${crossSite.status}`);
+    check("跨站响应不含正文", !crossSite.body.includes(probe.expectedText));
+  }
+}
+
+interface RevealProbe {
+  courseId: string;
+  segmentId: string;
+  /** 从页面 HTML 上读出的风险指纹；读不到时为 null。 */
+  fingerprint: string | null;
+  /** 该段的合成正文（用于断言"确实下发了正文"）。 */
+  expectedText: string;
+}
+
+/**
+ * 用合成夹具准备一个**独立**实例的数据，并读出页面上的风险指纹。
+ *
+ * ── 为什么需要这一步 ──
+ *
+ * 只验证"GET 返回 200"证明不了"授权揭示能工作"：真正的授权路径要带
+ * 一个服务端认可的风险指纹。而那个指纹是服务端算的，只能在真实页面里
+ * 读出来 —— 这正是"用真实 HTTP 证明"而不是"照抄常量"的意义。
+ *
+ * 全部数据都在 `.e2e/loopback-proof-*` 下：不碰 `private-content/`，
+ * 不碰 `data/cet6.db`。
+ */
+async function seedProbeData(): Promise<RevealProbe> {
+  const courseId = "fixture-course-loopback-proof";
+  const segmentId = "reading.a";
+  const expectedText = "Fixture course reading passage.";
+
+  // 每次清空重来：证明必须可重复。
+  for (const suffix of ["", "-wal", "-shm"]) {
+    const file = `${E2E_LOOPBACK_PROOF_DB_PATH}${suffix}`;
+    if (existsSync(file)) rmSync(file, { force: true });
+  }
+  rmSync(E2E_LOOPBACK_PROOF_CONTENT_ROOT, { recursive: true, force: true });
+  mkdirSync(E2E_LOOPBACK_PROOF_CONTENT_ROOT, { recursive: true });
+
+  process.env.CET6_CONTENT_ROOT = E2E_LOOPBACK_PROOF_CONTENT_ROOT;
+  process.env.CET6_DB_PATH = E2E_LOOPBACK_PROOF_DB_PATH;
+
+  const { getRepositories } = await import("@/repositories/sqlite");
+  const { commitCourseImport, planCourseImport } = await import("@/services/course-import");
+  const { buildCourseFixture, writeCourseFixture } = await import("./course-fixture");
+
+  writeCourseFixture(
+    E2E_LOOPBACK_PROOF_CONTENT_ROOT,
+    courseId,
+    buildCourseFixture({ id: courseId }),
+  );
+
+  /*
+   * 先 seed profile：曝光行有 `profile_id` 外键，而揭示端点在未登录时
+   * 会失败关闭（403）。因此"授权揭示能工作"这条判据必须先有一个学习者。
+   *
+   * 复用仓库既有的 `seed-onboard.ts`（与其它合成启动器同一条路径），
+   * 而不是在证明里自己拼一份 profile 写入逻辑。
+   */
+  execSync(
+    `"${process.execPath}" --experimental-transform-types --import ./scripts/alias-loader.mjs scripts/seed-onboard.ts`,
+    { stdio: "ignore", env: process.env },
+  );
+
+  const repos = getRepositories();
+  if (!repos.learner.getProfile()) {
+    throw new Error("回环证明：seed 之后仍读不到 profile");
+  }
+
+  const plan = planCourseImport(repos);
+  if (plan.report.counts.rejected > 0) {
+    throw new Error("回环证明的课程夹具被导入器拒绝");
+  }
+  const committed = commitCourseImport(repos, plan);
+  if (!committed.ok) throw new Error(`回环证明的课程夹具导入失败：${committed.error}`);
+
+  const { computeRevealRisk } = await import("@/services/reveal-risk");
+  const risk = computeRevealRisk(repos, courseId, segmentId);
+
+  return { courseId, segmentId, fingerprint: risk.fingerprint, expectedText };
+}
+
+async function main(): Promise<void> {
+  console.log("本地回环绑定与同源一致性 · 运行时证明（真实 next dev / next start，合成数据）\n");
+
+  const probe = await seedProbeData();
+
+  /*
+   * 两个端口刻意不同：证明"端口是配置出来的"，而不是写死的。
+   * 若守卫把端口写死，`start`（或 `dev`）那个实例会被自己的守卫挡掉。
+   */
+  const startPort = E2E_LOOPBACK_PROOF_PORT;
+  const devPort = E2E_LOOPBACK_PROOF_DEV_PORT;
+
+  // ── 生产：`pnpm start` ──
+  const startChild = startServer("start", startPort);
+  if (!(await waitForPort(startPort))) {
+    check("合成实例（start）成功启动", false, "服务未在 90 秒内就绪");
+    await stopServer(startChild, startPort);
+    return;
+  }
+  check("合成实例（start）成功启动", true);
+  await verifyInstance("pnpm start", startPort, probe);
+  await stopServer(startChild, startPort);
+
+  // ── 开发：`pnpm dev` ──
+  const devChild = startServer("dev", devPort);
+  if (!(await waitForPort(devPort))) {
+    check("合成实例（dev）成功启动", false, "服务未在 90 秒内就绪");
+    await stopServer(devChild, devPort);
+    return;
+  }
+  check("合成实例（dev）成功启动", true);
+  await verifyInstance("pnpm dev", devPort, probe);
+  await stopServer(devChild, devPort);
+
+  console.log(`\n结果：${passed} 通过 / ${failed} 失败`);
+  if (failed > 0) process.exitCode = 1;
+
+  // 硬超时兜底：绝不挂住（CI 上一次挂住会浪费整轮预算）。
+  setTimeout(() => process.exit(process.exitCode ?? 0), 3000).unref();
+}
+
+main().catch((error: unknown) => {
+  console.error("回环绑定证明失败：", error instanceof Error ? error.message : error);
+  process.exitCode = 1;
+});

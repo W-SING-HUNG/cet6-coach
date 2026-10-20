@@ -1,0 +1,72 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+#
+# `.env*` keeps every real environment file out: `.env`, `.env.local`,
+# `.env.production`, `.env.*.local` and anything else an operator might write a
+# credential into. That breadth is deliberate — the cost of ignoring a file that
+# should ship is one line below; the cost of tracking one that should not is a
+# leaked secret that cannot be un-published.
+#
+# The negation re-includes **only** the template. It is the one `.env*` file
+# whose entire content is placeholders, and a reader cannot configure the app
+# without it. Per gitignore(5), `!` re-includes a path excluded by an earlier
+# pattern as long as no *parent directory* is excluded — `.env*` matches file
+# names, never a directory, so this re-inclusion is reliable rather than
+# incidental. A future broad rule such as `.env/` would break it, which is why
+# the release gate asserts the file is in the index rather than assuming it.
+.env*
+!.env.example
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# 本地数据库（真实学习数据，绝不入库）
+/data/
+
+# E2E 产物与隔离数据库
+/.e2e/
+
+# 私有内容库：真实真题试卷、听力音频与图片。
+#
+# 为什么不入库：真题内容有版权、体积大（单套听力音频可达数十 MB），
+# 且它是**用户本机的内容**而不是产品代码。仓库分发的是读取与校验它的程序，
+# 不是内容本身。
+/private-content/
+
+# Export tooling output (staging workspace only)
+/.public-export-manifest.json

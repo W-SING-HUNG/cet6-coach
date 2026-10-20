@@ -1,0 +1,333 @@
+/*
+ * 源检测范围：**只扫 `src/`**，不扫仓库里的其它文本。
+ *
+ * 为什么必须限定 —— Tailwind v4 把源文件当**纯文本**扫描：只要某个 token
+ * 长得像工具类，它就生成对应 CSS。工程文档（`docs/`、根目录 md）
+ * 里的说明性文字因此会被当成真实用法。当正文为了举例而写出一个「语法上
+ * 不完整」的任意值工具类时，生成的声明本身就是非法的，PostCSS 直接解析
+ * 失败 —— dev 与 build 一起挂掉。
+ *
+ * 文档不是运行时，**不应当能影响构建产物**。
+ *
+ * 为什么用白名单而不是黑名单：黑名单必须逐个排除 `.opc`、`docs` 以及
+ * 以后新增的任何一个文档文件，漏掉一个就复发。`source("..")` 相对
+ * **本文件所在目录**（`src/app/`）解析，即 `src/` —— 唯一可能含有
+ * 真实工具类的树。注意：路径相对样式表，不是项目根。
+ *
+ * 影响面：`src/` 之外没有任何被真实组件引用的工具类，因此下面这条
+ * 只改「扫哪些文件」，不改任何产品视觉行为。
+ */
+@import "tailwindcss" source("..");
+
+/*
+ * 设计令牌 v2 —— 应用型视觉语言（替换 v1 的 editorial paper / ink）。
+ *
+ * ── 为什么换 ──
+ * v1 的令牌围绕"纸面 / 墨色"命名（`paper` / `ink` / `line`）。它适合一篇长文，
+ * 但它把**产品**说成了**文档**：所有表面都是同一张纸的不同深浅，
+ * 于是层级只能靠细线和小字号堆出来，界面越堆越碎。
+ *
+ * v2 以**表面层级**命名（`surface` / `content` / `border` / `accent`）。
+ * 名字决定用法：`surface` 有四级（app / raised / sunken / inset），
+ * 可以清晰表达"应用底色 → 面板 → 凹陷区 → 阅读纸面"，
+ * 而不需要给每个区块都描边。
+ *
+ * ── 明确不做的 ──
+ * 不做渐变、玻璃拟态、霓虹色、彩色卡片矩阵、大面积阴影。
+ * 替换的是**命名与层级模型**，不是"变得花哨"。
+ *
+ * 命名的目标：一眼能看出谁是正文、谁是界面、谁是阅读材料。
+ */
+
+@theme {
+  /* 表面层级：应用底色 → 面板 → 凹陷 → 阅读纸面 */
+  --color-surface: #f4f5f7;
+  --color-surface-raised: #ffffff;
+  --color-surface-sunken: #e9ebef;
+  --color-surface-inset: #dfe2e8;
+
+  /* 文字层级 */
+  --color-content: #14161a;
+  --color-content-soft: #4a4f57;
+  --color-content-faint: #767d87;
+
+  /*
+   * 描边层级。
+   * 命名为 `edge` 而不是 `border`：颜色令牌会拼进工具类名，
+   * `border-border-strong` 这种重复读法会让代码难读，`border-edge-strong` 不会。
+   */
+  --color-edge: #dcdfe5;
+  --color-edge-strong: #c2c7cf;
+
+  /*
+   * 唯一强调色：深青绿。
+   * 保留 v1 的品牌色相（它的辨识度已经建立），但提高饱和度以便在
+   * 中性灰底上仍然突出 —— 应用底色从暖白换成冷灰后，旧的松绿会显得发灰。
+   */
+  --color-accent: #15604d;
+  --color-accent-hover: #0f4a3b;
+  --color-accent-soft: #e2efea;
+
+  /* 状态色：只用于状态，不用于装饰 */
+  --color-warn: #8a5316;
+  --color-warn-soft: #fbf0e0;
+  --color-danger: #a12b2b;
+  --color-danger-soft: #fbeaea;
+  --color-succ: #1f6b45;
+
+  /*
+   * 选项排除色：被划掉的选项必须明显"退后"，
+   * 但仍要可读（学习者经常要回头把它恢复）。
+   */
+  --color-strike: #98a0aa;
+
+  /*
+   * 字体：以现代无衬线为主。
+   *
+   * 刻意**不**在此处新增 webfont 下载或 CDN 引用：那会引入网络依赖、
+   * 拖慢首屏，且与本项目的本地优先取向冲突（离线也要能用）。
+   * 因此这里给出的是一个**有意图的字体栈**：优先使用若已安装的
+   * Inter / 系统界面字体，并明确中文字体的回退顺序，
+   * 而不是依赖 Tailwind 的默认栈。
+   */
+  --font-sans: "Inter", "Segoe UI Variable Text", ui-sans-serif, system-ui,
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+  /*
+   * 阅读字体：只用于英语阅读正文。
+   * 保留一个衬线栈是**功能性**决定（长英文段落用衬线更省力），
+   * 但它不再被当作"产品标题字体" —— 标题回到 sans，界面才像应用而不像刊物。
+   */
+  --font-reading: ui-serif, "Iowan Old Style", "Palatino Linotype", "Source Serif 4",
+    Georgia, serif;
+
+  /* 圆角：一致且克制。输入类控件比容器略小，形成稳定的层次。 */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--color-surface);
+    color: var(--color-content);
+    font-family: var(--font-sans);
+    font-feature-settings: "kern" 1;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /*
+   * 阅读材料：只在**真实的长英文篇章**上使用。
+   * 行高与字号在这里是阅读工效参数，不是风格偏好。
+   */
+  .prose-reading {
+    font-family: var(--font-reading);
+    font-size: 1.0625rem;
+    line-height: 1.78;
+    hanging-punctuation: first;
+  }
+
+  .prose-reading p + p {
+    margin-top: 1em;
+  }
+
+  ::selection {
+    background: var(--color-accent-soft);
+    color: var(--color-content);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+    border-radius: 3px;
+  }
+
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/*
+ * ── 应用画布：全站页面级 gutter 的**唯一权威** ──
+ *
+ * ── 为什么这些规则**刻意不放进任何 @layer** ──
+ *
+ * 上一版把画布规则写在 `@layer base` 里，而 AppShell 的 `<main>` 又带了
+ * `px-0`。Tailwind v4 把 utilities 放在 base **之后**的层里，而 CSS
+ * Cascade Layers 规定「后声明的层胜出、层外样式胜过所有层」——
+ * 于是 `px-0` 一条工具类就静默抵消了全站 gutter，浏览器实测 main 的
+ * padding 为 `0px`，所有常规页面贴边。
+ *
+ * 因此这里刻意把画布规则放在**层外**（unlayered）。层外样式优先于任何
+ * `@layer`，包括 `utilities`。这不是"顺手调顺序"，而是让
+ * "页面级 gutter 只能由共享容器决定"成为**结构事实**：
+ * 任何页面再写 `px-0` 也无法把 gutter 抵消掉。
+ *
+ * 与第二层保护配套的是 `tests/app-shell-layout.test.ts`：它断言
+ * 画布规则不在 @layer 内、且 AppShell 的 `<main>` 不再携带水平内边距工具类。
+ *
+ * ── 分工 ──
+ * 共享容器（本文件）负责：页面居中、最大宽度、响应式 gutter、上下留白。
+ * 具体页面负责：自身内容排版（栅格、卡片间距、内部 padding）。
+ * 两者不得重复承担同一件事 —— 否则就会出现"双重 padding"或"两套宽度打架"。
+ */
+.app-canvas {
+  margin-inline: auto;
+  width: 100%;
+}
+
+/*
+ * Wide —— 常规应用页面（Today / Practice / Review / Progress /
+ * 真题列表 / 课程列表 / 课程详情）。
+ *
+ * 最大宽度 1280px：在 1440 与 1920 上都能保持"内容居中、两翼舒展"，
+ * 而不是把正文拉成一条过长行长（那会显著降低扫视效率）。
+ */
+[data-shell="wide"] .app-canvas {
+  max-width: 1280px;
+  padding-inline: 1rem; /* 手机 16px */
+  padding-block: 1.25rem 6rem; /* 底部避让固定导航 */
+}
+
+/* 小平板：20px */
+@media (min-width: 640px) {
+  [data-shell="wide"] .app-canvas {
+    padding-inline: 1.25rem;
+    padding-block: 1.75rem 2.5rem;
+  }
+}
+
+/* 平板与桌面：24px */
+@media (min-width: 768px) {
+  [data-shell="wide"] .app-canvas {
+    padding-inline: 1.5rem;
+  }
+}
+
+/* 超宽屏：32px */
+@media (min-width: 1536px) {
+  [data-shell="wide"] .app-canvas {
+    padding-inline: 2rem;
+  }
+}
+
+/*
+ * Focused —— 表单类页面（Settings / Onboarding / Diagnostic）。
+ *
+ * 保留窄宽度：设置项与表单是「短标签 + 短输入」，拉满 1280 只会让
+ * 标签与输入框之间隔着半米。窄在这里是**工效选择**，不是妥协。
+ * 但 gutter 与上下留白与 Wide **完全共用同一套规则**，所以视觉节奏一致。
+ */
+[data-shell="focused"] .app-canvas {
+  max-width: 720px;
+  padding-inline: 1rem;
+  padding-block: 1.25rem 6rem;
+}
+
+@media (min-width: 640px) {
+  [data-shell="focused"] .app-canvas {
+    padding-inline: 1.25rem;
+    padding-block: 1.75rem 2.5rem;
+  }
+}
+
+@media (min-width: 768px) {
+  [data-shell="focused"] .app-canvas {
+    padding-inline: 1.5rem;
+  }
+}
+
+@media (min-width: 1536px) {
+  [data-shell="focused"] .app-canvas {
+    padding-inline: 2rem;
+  }
+}
+
+/*
+ * Immersive —— 答题与阅读工作区。
+ *
+ * **不设 max-width、不加内边距**：分栏宽度、工作区高度、固定操作栏与
+ * 滚动位置全部由工作区自己管理。任何全局 gutter 在这里都会破坏
+ * 「原文与题目并排」的布局，因此这一条是硬边界。
+ */
+[data-shell="immersive"] .app-canvas {
+  max-width: none;
+  padding-inline: 0;
+  padding-block: 0;
+}
+
+/*
+ * 自定义工具用 `@utility` 声明，而不是写进 `@layer utilities`。
+ *
+ * 为什么必须这样：`@layer utilities` 里的普通类**不参与变体生成**，
+ * 于是 `lg:workspace-height` 会静默失效 —— 桌面分栏拿不到高度，
+ * 整页变成一条长滚动，恰好退回到这次要修的那个问题。
+ * `@utility` 是 Tailwind v4 的受支持入口，`lg:` / `sm:` 变体因此可用。
+ */
+@utility scroll-region {
+  /*
+   * 独立滚动区：阅读材料与题目各自滚动，不带动整页。
+   * 这是"不必往回翻几屏看原文"的实现前提。
+   * `overscroll-behavior: contain` 防止滚到底后连锁滚动整页。
+   */
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  /* 分栏下同时存在两条滚动条，默认宽滚动条会喧宾夺主 */
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-edge-strong) transparent;
+
+  &::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  &::-webkit-scrollbar-thumb {
+    background-color: var(--color-edge-strong);
+    border-radius: 999px;
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+/* 桌面分栏的高度基准：满屏减去训练头高度 */
+@utility workspace-height {
+  height: calc(100dvh - var(--workspace-header-height, 3.25rem));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* 进场：一次性、克制，不参与交互动效 */
+@keyframes reveal {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.reveal {
+  animation: reveal 0.42s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.reveal-1 { animation-delay: 0.04s; }
+.reveal-2 { animation-delay: 0.09s; }
+.reveal-3 { animation-delay: 0.14s; }
+.reveal-4 { animation-delay: 0.19s; }

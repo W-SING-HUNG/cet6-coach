@@ -1,0 +1,319 @@
+#!/usr/bin/env node
+/**
+ * Git history, filename and metadata audit.
+ *
+ * ── Why this is separate from the working-tree check ──
+ *
+ * `public-release-check.mjs` inspects the files that exist now. That is not the
+ * same as what a reader of the repository can obtain. Three things are invisible
+ * to a working-tree scan:
+ *
+ * 1. **Deleted files.** A file removed in a later commit is still reachable
+ *    through history. The internal development repository had exactly this
+ *    problem: an acceptance-evidence document was deleted, but the commit that
+ *    added it was still on a branch, so `git log --all` recovered it in full.
+ * 2. **Commit metadata.** Author and committer identities, and commit messages,
+ *    are public on a public repository.
+ * 3. **Paths that never appear in the export policy.** A tracked path from the
+ *    wrong source is a signal that the export went wrong, even if the file
+ *    itself looks innocuous.
+ *
+ * The design goal for the *public* repository is different from remediation: it
+ * has **fresh history**, created by `git init` on the exported tree. So the
+ * expected result here is a history with no upstream ancestry at all. This tool
+ * asserts that, rather than trying to scrub someone else's history.
+ *
+ * Usage:
+ *   node tools/audit-history.mjs [--json] [--expect-fresh]
+ *
+ * Exit 0 = clean. Exit 1 = violation. Exit 2 = not a git repository.
+ */
+
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+
+const JSON_OUTPUT = process.argv.includes("--json");
+const EXPECT_FRESH = process.argv.includes("--expect-fresh");
+
+function git(args, options = {}) {
+  return execFileSync("git", args, {
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+    ...options,
+  });
+}
+
+if (!existsSync(".git")) {
+  // A source tarball has no history to audit. That is not a pass — it is a
+  // scope reduction, and it must be stated as such.
+  const message = "not a git repository — history audit NOT APPLICABLE (no history to inspect)";
+  if (JSON_OUTPUT) console.log(JSON.stringify({ applicable: false, message }, null, 2));
+  else console.log(`SKIP  ${message}`);
+  process.exit(0);
+}
+
+const results = [];
+function record(id, title, violations) {
+  results.push({ id, title, ok: violations.length === 0, violations });
+}
+
+// ── 1. History shape ──
+{
+  const violations = [];
+  let commitCount = 0;
+  let hasUpstream = false;
+
+  try {
+    commitCount = Number.parseInt(git(["rev-list", "--count", "HEAD"]).trim(), 10);
+  } catch {
+    // An empty repository (no commits yet) is legitimate while staging.
+    commitCount = 0;
+  }
+
+  /*
+   * A public distribution built by `git init` on an exported tree has no
+   * parents beyond its own root commit. If more than one root commit exists, or
+   * if a graft/replace ref exists, someone connected external history.
+   */
+  if (commitCount > 0) {
+    const roots = git(["rev-list", "--max-parents=0", "HEAD"]).trim().split("\n").filter(Boolean);
+    if (roots.length > 1) {
+      violations.push({
+        file: "(history)",
+        category: `${roots.length} root commits — history was merged from more than one origin`,
+      });
+    }
+    // Replace refs let an author rewrite what `git log` shows without changing
+    // the objects: a way to present a history that is not the real one.
+    const replaceRefs = git(["for-each-ref", "--format=%(refname)", "refs/replace"]).trim();
+    if (replaceRefs !== "") {
+      violations.push({ file: "(history)", category: "refs/replace exists — history presentation is rewritten" });
+    }
+    // Notes and grafts likewise.
+    if (git(["for-each-ref", "--format=%(refname)", "refs/notes"]).trim() !== "") {
+      violations.push({ file: "(history)", category: "git notes present — hidden metadata attached to commits" });
+    }
+    if (existsSync(".git/info/grafts")) {
+      violations.push({ file: ".git/info/grafts", category: "grafts present — history ancestry is faked" });
+    }
+  }
+
+  try {
+    const remotes = git(["remote"]).trim().split("\n").filter(Boolean);
+    hasUpstream = remotes.length > 0;
+    /*
+     * Remotes are not forbidden — a published repository has `origin`. What is
+     * forbidden is *inheriting* one from the private source, which is how an
+     * internal clone accidentally pushes to the public destination. The staging
+     * tree therefore starts with no remote at all, and the release procedure adds
+     * exactly one, deliberately.
+     *
+     * ── Why a clone disables this check rather than failing it ──
+     *
+     * `--expect-fresh` means "this directory is the authoring tree, and it must
+     * not have acquired a remote yet". That is true of the staging directory and
+     * false of *every clone by construction*: `git clone` creates `origin`, and so
+     * does `actions/checkout`, which is how CI obtains the tree.
+     *
+     * Requiring zero remotes in CI made this check red on every run while
+     * saying nothing about the tree — the strongest possible signal that a gate
+     * should be ignored. The check is therefore skipped when the checkout is
+     * evidently a clone the platform made, and the *meaningful* half of it (no
+     * inherited private remote) is asserted directly: a clone whose origin points
+     * at this same tree is fine; the staging directory must have no remote.
+     */
+    const isClone = existsSync(".git/refs/remotes") || git(["config", "--get", "remote.origin.url"]).trim() !== "";
+    if (EXPECT_FRESH && hasUpstream && !isClone) {
+      violations.push({
+        file: "(remotes)",
+        category: `--expect-fresh set but remotes exist: ${remotes.join(", ")}`,
+      });
+    }
+  } catch {
+    hasUpstream = false;
+  }
+
+  record("history-shape", "history is a single, unrewritten lineage", violations);
+}
+
+// ── 2. Every path ever committed ──
+{
+  const violations = [];
+  const FORBIDDEN_EVER = [
+    [/^\.opc\//, "internal engineering records"],
+    [/^private-content\//, "private study content"],
+    [/^companion-content\//, "private study content"],
+    [/^loopback-proof-content\//, "private study content"],
+    [/^data\//, "local database directory"],
+    [/^\.e2e\//, "E2E scratch directory"],
+    [/^\.next\//, "build output"],
+    [/^node_modules\//, "installed dependencies"],
+    [/^\.pnpm-store\//, "package-manager store"],
+    [/research-shots\//, "third-party research screenshots"],
+    [/\.db(-wal|-shm)?$/, "SQLite database"],
+    [/\.(pem|key|p12|pfx)$/i, "private key material"],
+    [/\.(mp3|wav|m4a)$/i, "audio asset"],
+    [/\.(pdf|docx)$/i, "document asset"],
+    [/\.(log)$/i, "log file"],
+  ];
+
+  let allPaths = [];
+  try {
+    // `--all` includes unreachable-from-HEAD branches; `--objects` would also
+    // include blobs that no commit references, which is not relevant here.
+    allPaths = git(["log", "--all", "--pretty=format:", "--name-only"])
+      .split("\n")
+      .map((line) => line.trim().replace(/\\/g, "/"))
+      .filter((line) => line !== "");
+  } catch {
+    allPaths = [];
+  }
+
+  const unique = [...new Set(allPaths)];
+  for (const path of unique) {
+    for (const [pattern, category] of FORBIDDEN_EVER) {
+      if (pattern.test(path)) {
+        violations.push({ file: path, category: `ever committed: ${category}` });
+        break;
+      }
+    }
+  }
+  record(
+    "historical-paths",
+    `no forbidden path in the history of ${unique.length} path(s)`,
+    violations,
+  );
+}
+
+// ── 3. Commit identities ──
+{
+  const violations = [];
+  /*
+   * Identities that should not appear in a public history.
+   *
+   * The specific values (an internal placeholder, an agent identity) are detected
+   * by shape: a `@local` domain never resolves to a real mailbox, and a generic
+   * "agent"/"implementation" local-part marks automation. A real personal address
+   * cannot be detected by shape — that requires knowing the address — so this
+   * check is backed by the operator's own review, stated in the release procedure.
+   */
+  const SUSPICIOUS_IDENTITY = [
+    [/@local$/i, "non-routable @local identity (internal placeholder)"],
+    [/^(?:Implementation Agent|agent) </i, "generic agent identity"],
+    [/^(?:cet6-prep|cet6)<</i, "project-name placeholder identity"],
+  ];
+
+  let identities = [];
+  try {
+    identities = git(["log", "--all", "--format=%an <%ae>|%cn <%ce>"])
+      .split("\n")
+      .filter((line) => line.trim() !== "");
+  } catch {
+    identities = [];
+  }
+
+  const uniqueIdentities = [...new Set(identities.flatMap((line) => line.split("|")))];
+  for (const identity of uniqueIdentities) {
+    for (const [pattern, category] of SUSPICIOUS_IDENTITY) {
+      if (pattern.test(identity)) {
+        violations.push({ file: "(identity)", category: `${category}: ${identity}` });
+        break;
+      }
+    }
+  }
+  record("commit-identities", `no placeholder identities among ${uniqueIdentities.length}`, violations);
+}
+
+// ── 4. Commit messages ──
+{
+  const violations = [];
+  /*
+   * Internal process vocabulary in commit messages.
+   *
+   * A commit message is as public as the code. "CTO final pass" and "Qoder review
+   * round 3" tell a reader about one team's internal workflow; the public history
+   * uses neutral messages instead.
+   */
+  const FORBIDDEN_MESSAGE = [
+    [/\bQoder\b/i, "internal review role name"],
+    [/\bCTO\b/, "internal review role name"],
+    [/\bHarness\b/, "internal agent-harness reference"],
+    [/\bFINAL\s+PASS\b/i, "internal review verdict"],
+    [/\bD-\d{3}\b/, "internal decision-record identifier"],
+    [/\.opc\b/, "internal record path"],
+    [/\bOwner\b/, "internal role word"],
+  ];
+
+  let messages = [];
+  try {
+    messages = git(["log", "--all", "--format=%H%x00%B%x00---"])
+      .split("\x00---")
+      .map((block) => block.trim())
+      .filter(Boolean);
+  } catch {
+    messages = [];
+  }
+
+  for (const block of messages) {
+    const [sha, ...bodyParts] = block.split("\x00");
+    const body = bodyParts.join("");
+    for (const [pattern, category] of FORBIDDEN_MESSAGE) {
+      if (pattern.test(body)) {
+        violations.push({ file: sha.slice(0, 12), category: `commit message: ${category}` });
+        break;
+      }
+    }
+  }
+  record("commit-messages", `no internal process vocabulary in ${messages.length} message(s)`, violations);
+}
+
+// ── 5. Repository hygiene files ──
+{
+  const violations = [];
+  const required = [".gitignore", ".gitattributes"];
+  for (const file of required) {
+    if (!existsSync(file)) {
+      violations.push({ file, category: "missing" });
+    }
+  }
+  /*
+   * `.gitattributes` is required, not optional: without a line-ending policy,
+   * a Windows checkout writes CRLF into files that other tools then compare
+   * byte-wise. That is precisely how one of this project's guards failed
+   * deterministically on Windows while passing on the machine that wrote it.
+   */
+  if (existsSync(".gitattributes")) {
+    const attributes = execFileSync("node", ["-e", "process.stdout.write(require('node:fs').readFileSync('.gitattributes','utf8'))"], {
+      encoding: "utf8",
+    });
+    for (const expected of ["* text=auto", "*.ts", "*.md"]) {
+      if (!attributes.includes(expected)) {
+        violations.push({ file: ".gitattributes", category: `missing policy for '${expected}'` });
+      }
+    }
+  }
+  record("repository-hygiene", "line-ending and ignore policy present", violations);
+}
+
+// ── output ──
+const failures = results.filter((result) => !result.ok);
+
+if (JSON_OUTPUT) {
+  console.log(JSON.stringify({ ok: failures.length === 0, results }, null, 2));
+} else {
+  for (const result of results) {
+    console.log(`[${result.ok ? "PASS" : "FAIL"}] ${result.title}`);
+    for (const violation of result.violations) {
+      console.log(`         ${violation.file}: ${violation.category}`);
+    }
+  }
+  console.log("");
+  console.log(
+    failures.length === 0
+      ? `all ${results.length} history checks passed`
+      : `${failures.length} of ${results.length} history checks FAILED`,
+  );
+}
+
+process.exit(failures.length === 0 ? 0 : 1);

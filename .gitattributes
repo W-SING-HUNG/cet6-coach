@@ -1,0 +1,74 @@
+# Normalise line endings in the working tree, independent of platform.
+#
+# ── Why this file is not optional ──
+#
+# Without a policy, `core.autocrlf=true` on Windows writes CRLF into checked-out
+# files while the repository stores LF. Anything that compares file contents
+# byte-wise then sees different bytes on different machines.
+#
+# That is not hypothetical here: a guard in this project determined whether a
+# destructive call sat inside a conditional by slicing source text at offsets
+# computed from `\n`. On a CRLF checkout every offset was one byte short, the
+# condition was read as empty, and the test failed deterministically on Windows
+# while passing everywhere else. The fix made the guard line-ending agnostic —
+# but the deeper fix is to stop line endings from varying at all.
+#
+# `text=auto` lets git decide per file, `eol=lf` normalises everything git treats
+# as text, and the explicit binary list prevents git from "helpfully" rewriting
+# audio, image or archive files.
+* text=auto eol=lf
+
+# ── Source and docs: always LF ──
+*.ts    text eol=lf
+*.tsx   text eol=lf
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.cjs   text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.svg   text eol=lf
+
+# ── Shell scripts must keep LF even on Windows, or they will not execute ──
+*.sh    text eol=lf
+*.bash  text eol=lf
+
+# ── Windows-native scripts need CRLF to run under cmd.exe / PowerShell ──
+*.ps1   text eol=crlf
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+
+# ── Binary: never inspect, never convert ──
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.pdf   binary
+*.docx  binary
+*.mp3   binary
+*.wav   binary
+*.m4a   binary
+*.zip   binary
+*.gz    binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+*.db    binary
+*.sqlite binary
+
+# ── Lockfiles: mark as generated so diffs and reviews treat them accordingly ──
+pnpm-lock.yaml linguist-generated=true
+
+# ── Keep the release tooling visible in diffs ──
+#
+# The release tooling is ordinary source: it is reviewed like any other code,
+# and a change to it must be as visible in a diff as a change to `src/`.
+# (The export *policy* is deliberately not part of this repository — it names
+# paths from the internal tree. See README § Repository policy.)
+tools/*.mjs -linguist-documentation

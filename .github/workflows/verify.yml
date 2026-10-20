@@ -1,0 +1,246 @@
+name: verify
+
+# ── What this workflow is and is not ──
+#
+# Two different questions need two different jobs, and conflating them is how
+# release gates end up bypassing themselves:
+#
+#   `quality`     — does the code work?      (lint, types, tests, build)
+#   `publication` — may this tree be shipped? (content policy, secrets, history,
+#                   artefact boundary, regression guards)
+#
+# The publication job is deliberately **not** gated on `quality` and does not
+# skip itself when quality fails. A broken build must never be able to suppress
+# the check that stops private material being published. For the same reason it
+# does not use `if:` conditions that let a fork PR skip it.
+#
+# ── Coverage, and why each gate is here ──
+#
+# An earlier version of this file ran six checks while the repository shipped
+# eleven. The gap was found in review: the archive boundary, the Git object audit,
+# the four regression guards and the secret-scan positive controls existed, were
+# wired into `pnpm verify`, and never ran on a pull request. A gate that only runs
+# when someone remembers to run it is a document, not a control.
+#
+# Every gate below is a `node` invocation that exits non-zero on failure. GitHub
+# Actions runs each `run:` step with `bash -e`, so a non-zero exit stops the step
+# and fails the job — no `|| true`, no `continue-on-error`, no swallowed status.
+#
+# ── Least privilege ──
+#
+# `contents: read` for the whole workflow. Neither job writes to the repository,
+# comments on the PR, uploads an artefact or uses a secret, so a pull request from
+# a fork gets exactly the same verdict as a branch. No Owner credential is
+# available to this workflow, which is what makes it safe to run on untrusted
+# code: there is nothing to steal and nothing to write.
+#
+# ── Required status checks for branch protection ──
+#
+# The job `name:` values are the check names to require:
+#
+#   "lint, types, tests, build"
+#   "public release gate"
+#
+# Requiring both is the point of the split: a green quality run must not be able
+# to stand in for a missing publication verdict.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A superseded run on the same ref is wasted work, but cancelling is only safe
+# because every job here is read-only.
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: lint, types, tests, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # Reads `packageManager` from package.json; do not duplicate the
+          # version here, or the two will drift.
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        # `--frozen-lockfile` is a supply-chain control, not a convenience: it
+        # guarantees CI installs exactly the resolved tree that was reviewed.
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit and integration tests
+        # Bounded workers: the suite spawns real CLI subprocesses, and one
+        # worker per file overruns the per-test timeout on a 2-core runner.
+        # The same value is documented in the README.
+        run: pnpm test:ci
+
+      - name: Production build
+        run: pnpm build
+
+      - name: Client bundle carries no internal directory names
+        # Inspects the real build output, not the source. This is the check the
+        # original defect required: the leak was only observable in the emitted
+        # chunk, so a source-level guard could not have caught it.
+        run: node tools/check-client-bundle.mjs
+
+      - name: Artefact boundary regression guards
+        # These need the build output and (for the source-map case) the emitted
+        # files, so they belong to the job that builds.
+        run: pnpm verify:scanner && node tools/guard-build-boundary.mjs
+
+  publication:
+    name: public release gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # ── pnpm must be installed before ANY step in this job invokes it ──
+      #
+      # `Token scanner and markdown comment controls` (below) runs
+      # `pnpm verify:scanner`. The setup action used to sit *after* that step —
+      # just above the artefact check — so the hosted runner failed with
+      # `pnpm: command not found` (exit 127), and every later step, including
+      # the archive/HTTP boundary, was skipped. The gate therefore never
+      # completed a full run.
+      #
+      # A local run cannot reproduce this: pnpm is already on PATH there. The
+      # only honest fix is to make pnpm exist before the first use, in the
+      # order the runner actually executes. Moving the step (rather than
+      # dropping `pnpm` from the command or tolerating its failure) keeps the
+      # gate at full strength: `verify:scanner` still runs, and a failure in it
+      # still fails the job.
+      #
+      # Placed after setup-node so that pnpm links against the same Node the
+      # rest of the job uses.
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # Reads `packageManager` from package.json; do not duplicate it here.
+          run_install: false
+
+      # ── Trees and objects ──
+      #
+      # The first four need nothing but Node and a checkout, which is deliberate:
+      # they must work on exactly the bare tree a reader downloads.
+
+      - name: Public release check
+        # No install step on purpose. The gate must work on a bare checkout,
+        # because that is exactly the state a released tree arrives in. If it
+        # needed `pnpm install` to run, it could not be trusted to gate itself.
+        #
+        # This check reads the Git index and HEAD, not the filesystem, so it also
+        # catches "the file exists here but a clone would not receive it" — the
+        # class of defect that produced a false green on `.env.example`.
+        run: node tools/public-release-check.mjs
+
+      - name: Git history and metadata audit
+        run: node tools/audit-history.mjs --expect-fresh
+
+      - name: Git object database audit
+        # Walks every object, including unreachable ones, and rejects a stored
+        # machine-account path, an internal record name or a non-neutral identity.
+        run: node tools/audit-object-database.mjs
+
+      - name: Content fingerprint scan
+        # Runs the rule set directly rather than through the test runner, so a
+        # broken test harness cannot make this check vacuous.
+        run: node --experimental-transform-types tools/check-exam-fingerprints.mjs
+
+      - name: Documentation reference check
+        # A README that names a file or command which does not exist is the same
+        # class of defect as a gate that claims to check something it does not:
+        # the reader cannot tell which statements to trust.
+        run: node tools/check-doc-references.mjs
+
+      # ── The gates must be able to fail ──
+      #
+      # A positive result proves the tree is clean today. It does not prove the
+      # check would notice tomorrow. These three plant defects in temporary trees
+      # and require the gate to refuse them.
+
+      - name: Gate negative controls
+        run: node --experimental-transform-types tools/gate-negative-controls.mjs
+
+      - name: Secret scanner positive and negative controls
+        run: node --experimental-transform-types tools/secret-scan-controls.mjs
+
+      - name: Workspace-path scanner negative controls
+        # Proves the structural internal-workspace-path check can fail: planted
+        # paths in a source comment, a test file and documentation must all be
+        # refused; an unfamiliar drive/directory must be refused without a
+        # denylist; a UNC network path naming a machine must be refused while a
+        # drive path with a double separator must NOT be mistaken for one; and
+        # legitimate OS paths, fixtures, redactions, URLs and app routes must stay
+        # green. Also asserts the refusal never echoes the path or the host name.
+        run: node tools/workspace-path-controls.mjs
+
+      - name: Licence gate negative controls
+        # The licence assertion changed direction: it used to require that NO
+        # licence existed, and now requires a genuine MIT licence whose every
+        # document agrees. Both directions can fail silently, so each wrong state
+        # is planted in a throwaway tree and the gate must refuse it: LICENSE
+        # deleted, MIT heading over a non-MIT body, copyleft terms appended, blank
+        # copyright holder, SPDX conflict, stale README/CONTRIBUTING, missing
+        # inbound=outbound, and either third-party carve-out removed.
+        run: node tools/license-check-controls.mjs
+
+      - name: Token scanner and markdown comment controls
+        run: pnpm verify:scanner && node tools/guard-token-scanner.mjs
+
+      - name: Source documentation reference controls
+        run: node tools/guard-source-doc-refs.mjs
+
+      - name: Internal-role reference guard
+        run: node tools/guard-role-references.mjs
+
+      # ── The artefact boundary ──
+      #
+      # Runs last because it needs a dependency install (for the HTTP probe) and a
+      # build. It asserts two different things: a `git archive` of HEAD carries no
+      # generated file, and a running production server serves no server-private
+      # document.
+
+      # (pnpm is installed at the top of this job — before every step that
+      # invokes it. The duplicate setup step that used to sit here is gone; a
+      # second `pnpm/action-setup` in the same job is redundant and makes the
+      # ordering requirement harder to see.)
+
+      - name: Install dependencies for the artefact check
+        run: pnpm install --frozen-lockfile
+
+      - name: Production build
+        run: pnpm build
+
+      - name: Release archive and HTTP boundary
+        run: node tools/check-release-archive.mjs
