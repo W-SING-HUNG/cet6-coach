@@ -236,10 +236,10 @@ function record(id, title, violations) {
    * public history uses neutral messages instead.
    */
   const FORBIDDEN_MESSAGE = [
-    [new RegExp("\\b" + ["Qo", "der"].join("") + "\\b", "i"), "internal review role name"],
-    [/\bCTO\b/, "internal review role name"],
-    [/\bHarness\b/, "internal agent-harness reference"],
-    [/\bFINAL\s+PASS\b/i, "internal review verdict"],
+    [/\b[A-Z][A-Za-z0-9._-]{2,23}\s+review\s+round\s+\d+/, "internal review attribution"],
+    [/\breview(?:ed)?\s+by\s+(?:the\s+)?[A-Z][A-Za-z0-9._-]{2,23}\b/, "internal review attribution"],
+    [/\b[A-Z][A-Z0-9]{2,15}\s+(?:FINAL\s+)?(?:PASS|APPROVED|SIGNED\s+OFF)\b/, "internal review verdict"],
+    [/\bfinal\s+pass\b/, "internal review verdict"],
     [/\bD-\d{3}\b/, "internal decision-record identifier"],
     [/\.opc\b/, "internal record path"],
     [/\bOwner\b/, "internal role word"],

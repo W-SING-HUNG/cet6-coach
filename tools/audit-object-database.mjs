@@ -845,10 +845,10 @@ function record(id, title, violations, note = "") {
   const violations = [];
   const message = git(["log", "-1", "--format=%B", AUDIT_TARGET]);
   const forbidden = [
-    [new RegExp("\\b" + ["Qo", "der"].join("") + "\\b", "i"), "internal review role name"],
-    [/\bCTO\b/, "internal review role name"],
-    [/\bHarness\b/, "internal agent-harness reference"],
-    [/\bFINAL\s+PASS\b/i, "internal review verdict"],
+    [/\b[A-Z][A-Za-z0-9._-]{2,23}\s+review\s+round\s+\d+/, "internal review attribution"],
+    [/\breview(?:ed)?\s+by\s+(?:the\s+)?[A-Z][A-Za-z0-9._-]{2,23}\b/, "internal review attribution"],
+    [/\b[A-Z][A-Z0-9]{2,15}\s+(?:FINAL\s+)?(?:PASS|APPROVED|SIGNED\s+OFF)\b/, "internal review verdict"],
+    [/\bfinal\s+pass\b/, "internal review verdict"],
     [/\bN-[1-4]\b/, "internal review finding identifier"],
     [/\bF-\d\b/, "internal review finding identifier"],
     [/\bD-\d{3}\b/, "internal decision-record identifier"],

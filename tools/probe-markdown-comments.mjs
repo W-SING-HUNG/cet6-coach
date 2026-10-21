@@ -13,7 +13,7 @@
 
 import { findTokensOutsideComments } from "./structural-scan.mjs";
 
-const TOKEN = ["Qo", "der"].join("");
+const TOKEN = "Syntheticprobe";
 const PATTERNS = [[new RegExp(`\\b${TOKEN}\\b`), "role"]];
 
 const cases = [

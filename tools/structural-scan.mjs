@@ -16,7 +16,7 @@
  * literal strip removed the whole template including its `${...}` interpolations,
  * so
  *
- *     const x = `SOMETOKEN FINAL PASS ${y}`;
+ *     const x = `SOMETOKEN FINAL VERDICT ${y}`;
  *
  * became invisible. Template literals are the most ordinary way to build a string
  * in modern JavaScript, which makes them the most likely place for a real
@@ -416,7 +416,20 @@ export { classifyRegions };
  * had enumerated.
  */
 if (process.argv[1] && process.argv[1].endsWith("structural-scan.mjs")) {
-  const TOKEN = ["Qo", "der"].join("");
+  /*
+   * A synthetic probe token, not a real name.
+   *
+   * This self-test needs *some* identifier to plant in each structural position,
+   * and it used to use the internal workflow's assistant-tool name, assembled
+   * from fragments. That was a disclosure dressed as a fixture: the fragments
+   * reconstruct the name for any reader. A self-test measures the *classifier*,
+   * so the token only has to be an identifier the classifier can be pointed at.
+   *
+   * This one is visibly synthetic, is not any product's name, and is used with
+   * `FINAL VERDICT` rather than a real verdict phrase for the same reason.
+   */
+  const TOKEN = "Syntheticprobe";
+  const VERDICT = "FINAL VERDICT";
   // Assembled from TOKEN, so this file never carries the literal token it scans for.
   const PATTERNS = [[new RegExp(`\\b${TOKEN}\\b`), "role"]];
 
@@ -425,12 +438,12 @@ if (process.argv[1] && process.argv[1].endsWith("structural-scan.mjs")) {
     ["bare identifier is code", `const ${TOKEN} = 1;`, true, "code"],
     ["double-quoted string value", `const x = "${TOKEN}";`, true, "string"],
     ["single-quoted string value", `const x = '${TOKEN}';`, true, "string"],
-    ["template literal text", `const x = \`${TOKEN} FINAL PASS\`;`, true, "template-text"],
+    ["template literal text", `const x = \`${TOKEN} ${VERDICT}\`;`, true, "template-text"],
     ["template interpolation", `const x = \`a\${${TOKEN}}b\`;`, true, "interpolation"],
     ["nested template", `const x = \`a\${\`b\${${TOKEN}}\`}c\`;`, true, "interpolation"],
     ["regexp literal", `const re = /${TOKEN}/;`, true, "regexp"],
-    ["line comment is excluded", `// ${TOKEN} FINAL PASS`, false, null],
-    ["block comment is excluded", `/* ${TOKEN} FINAL PASS */`, false, null],
+    ["line comment is excluded", `// ${TOKEN} ${VERDICT}`, false, null],
+    ["block comment is excluded", `/* ${TOKEN} ${VERDICT} */`, false, null],
     ["comment then code still detects", `// ${TOKEN}\nconst a = "${TOKEN}";`, true, "string"],
     ["token after an unterminated template", `const x = \`unterminated ${TOKEN}`, true, "template-text"],
     ["division is not a regexp", `const a = b / c; const d = "${TOKEN}";`, true, "string"],

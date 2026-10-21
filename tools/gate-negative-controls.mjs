@@ -595,10 +595,23 @@ function runGate(directory) {
    * A forbidden token as executable code, not as a pattern literal. This is the
    * exact shape the exemption was supposed to cover and did not: a bare word in
    * code that no comment or string literal contains.
+   *
+   * ── Why the planted word is a shape and not a bare acronym ──
+   *
+   * This control used to plant a bare role acronym. That passed for the wrong
+   * reason: the acronym is *not* one of the enforced shapes (see the note in
+   * `INTERNAL_PROCESS_PATTERNS` about not matching a bare word), so the gate did
+   * not refuse it as a token — the planted line was a bare identifier, the module
+   * threw a ReferenceError, and the non-zero exit was read as a refusal. A
+   * control that passes because the tool crashed proves nothing about the scan.
+   *
+   * The planted text is now a real enforced shape — a review attribution — placed
+   * in an executable position, so the non-zero exit can only mean the token scan
+   * fired. `expectPlanted` still asserts the anchor was found.
    */
   const planted = original.replace(
     "const SKIP_DIRECTORIES = new Set([",
-    "const SKIP_DIRECTORIES = new Set([\n  // planted by the exemption control\n  CTO,",
+    'const SKIP_DIRECTORIES = new Set([\n  // planted by the exemption control\n  "Syntheticprobe review round 3",',
   );
   expectPlanted(planted, original);
   writeFileSync(exemptFile, planted, "utf8");
@@ -632,12 +645,22 @@ function expectPlanted(planted, original) {
  * interpolation, and a nested template.
  */
 {
-  const token = ["Qo", "der"].join("");
+  /*
+   * The probe is a full enforced shape, not a bare word.
+   *
+   * It has to be: the gate matches review attributions and sign-off verdicts by
+   * shape, not by a list of names (see the note in `INTERNAL_PROCESS_PATTERNS`).
+   * A bare invented word is not a violation, so planting one would have asserted
+   * "the gate refuses any identifier in a template" — which is not a rule this
+   * project has, and would have been a control that passes only if the gate were
+   * wrong.
+   */
+  const token = "Syntheticprobe review round 3";
 
   const shapes = [
-    ["20a", `const v = \`${token} FINAL PASS\`;`, "literal text"],
-    ["20b", `const v = \`a\${${token}}b\`;`, "interpolation"],
-    ["20c", `const v = \`a\${\`b\${${token}}\`}c\`;`, "nested template"],
+    ["20a", `const v = \`${token}\`;`, "literal text"],
+    ["20b", `const v = \`a \${${token}} b\`;`, "interpolation"],
+    ["20c", `const v = \`a \${\`b \${${token}} c\`} d\`;`, "nested template"],
   ];
 
   for (const [id, line, label] of shapes) {
@@ -658,7 +681,7 @@ function expectPlanted(planted, original) {
  * documentation, and an allowance file may contain it.
  */
 {
-  const token = ["Qo", "der"].join("");
+  const token = "Syntheticprobe";
   const scratch = makeTree((dir) => {
     const target = join(dir, "docs", "note.md");
     mkdirSync(dirname(target), { recursive: true });
@@ -668,50 +691,43 @@ function expectPlanted(planted, original) {
   rmSync(scratch, { recursive: true, force: true });
 }
 
-// ── control 15b: the CONTRIBUTING exemption is provable too ──
+// ── control 15b: the contribution guide has no blanket skip ──
 //
-// The contribution guide is exempt from the internal-process scan because it
-// states the rules, and a rule stated as "do not write X" has to name X. The
-// exemption proof applies to it exactly as it does to the tools.
+// The contribution guide states the rules, so it is the file most likely to be
+// granted a blanket skip. It has none: its allowance is a **ceiling of 0**, so
+// any occurrence of an enforced shape in it must be refused — whether the text
+// sits in code or in prose.
 //
-// ── What this control plants, and why it changed  ──
+// ── What this control plants, and why it changed ──
 //
-// It used to plant a prose sentence and assert rejection. That no longer
-// discriminates: `CONTRIBUTING.md` now carries a **counted allowance** of 2
-// tokens (the two phrases it must name), and `makeTree` writes a *blank* guide —
-// so a single planted sentence lands at 1, comfortably under the ceiling, and the
-// gate accepts it correctly.
+// It used to plant a bare identifier and assert rejection. That stopped
+// discriminating twice over: the guide no longer needs to name any token, and a
+// bare identifier is not one of the enforced shapes, so the planted line was
+// simply an undefined name rather than a scan hit.
 //
-// Planting more sentences until the count trips would test counting, not the
-// proof. The property worth asserting is the one the exemption is about:
-// **a token that is code is rejected even when the file has allowance left.**
-// A bare identifier is code; a quoted rule is documentation. The control plants
-// the identifier into the real guide, which already sits at its ceiling, and
-// asserts rejection on the *class* rather than the count.
+// It now plants a real enforced shape into the real guide. The property asserted
+// is the one that matters for this file: prose in a `.md` file is reader-visible,
+// so a review attribution written there is a disclosure and must be refused.
 {
   const scratch = makeTree();
   const guide = join(scratch, "CONTRIBUTING.md");
 
   /*
-   * Copy the real guide so the file is at its documented allowance, then add a
-   * token as executable code. If the gate's classification were broken — the
-   * original family of defects — this would slip through on the remaining
-   * headroom.
+   * Copy the real guide so the planted sentence lands in the file whose exemption
+   * is in question, not in a placeholder that might behave differently.
    */
   copyFileSync(join(ROOT, "CONTRIBUTING.md"), guide);
   const original = readFileSync(guide, "utf8");
-  const token = ["Qo", "der"].join("");
-  writeFileSync(guide, `${original}\n\nconst note = ${token};\n`, "utf8");
+  writeFileSync(guide, `${original}\n\nSign-off: Syntheticprobe review round 3.\n`, "utf8");
 
   const code = runGate(scratch);
   check(
-    "gate REFUSES a forbidden token appearing as code in the contribution guide",
+    "gate REFUSES an enforced shape written into the contribution guide",
     code !== 0,
     `exit ${code}`,
   );
   rmSync(scratch, { recursive: true, force: true });
 }
-
 // ── controls 16-18: the client-bundle check must cover server-side maps ──
 //
 // The defect class: a bundle check that scans only `.next/static/` and
