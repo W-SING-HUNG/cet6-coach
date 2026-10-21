@@ -180,10 +180,12 @@ because they only make sense inside one team's history:
 - **Internal records.** Decision identifiers, ticket prefixes, status-document
   names, the internal record directory. These are matched by shape in
   `tools/public-release-check.mjs`, not by a word list.
-- **Internal review verdicts.** "CTO final pass", "Qoder review round 3", and
-  similar. A commit message and a comment are both public.
-- **Internal process narration.** References to the agent runtime used during
-  development, in the sense of "this would pollute its context".
+- **Internal review verdicts.** The outcome of an internal review or sign-off,
+  quoted by role, tool name or review round, and the identifier of any internal
+  finding it produced. A commit message and a comment are both public.
+- **Internal process narration.** References to the specific assistant tooling,
+  session or runtime configuration used while developing, in the sense of "this
+  would pollute its context".
 
 AI involvement in development is **not** in that list. It is disclosed in the
 README and is not something this repository hides. The distinction is between

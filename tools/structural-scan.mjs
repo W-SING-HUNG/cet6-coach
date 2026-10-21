@@ -417,7 +417,8 @@ export { classifyRegions };
  */
 if (process.argv[1] && process.argv[1].endsWith("structural-scan.mjs")) {
   const TOKEN = ["Qo", "der"].join("");
-  const PATTERNS = [[/\bQoder\b/, "role"]];
+  // Assembled from TOKEN, so this file never carries the literal token it scans for.
+  const PATTERNS = [[new RegExp(`\\b${TOKEN}\\b`), "role"]];
 
   const cases = [
     // [description, source, expectHit, expectWhere]

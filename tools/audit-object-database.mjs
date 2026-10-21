@@ -697,7 +697,7 @@ function record(id, title, violations, note = "") {
   const violations = [];
   const message = git(["log", "-1", "--format=%B"]);
   const forbidden = [
-    [/\bQoder\b/i, "internal review role name"],
+    [new RegExp("\\b" + ["Qo", "der"].join("") + "\\b", "i"), "internal review role name"],
     [/\bCTO\b/, "internal review role name"],
     [/\bHarness\b/, "internal agent-harness reference"],
     [/\bFINAL\s+PASS\b/i, "internal review verdict"],
