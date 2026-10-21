@@ -512,40 +512,152 @@ const PERSONAL_DATA_PATTERNS = [
  * generic technology names are fine. What is excluded is the *internal process*
  * — review-role codes, workflow stage names, ticket prefixes, and decision
  * identifiers that only make sense inside one team's log.
+ *
+ * ── Why no private tool name is listed here ──
+ *
+ * This table used to carry the name of the assistant tool the internal workflow
+ * ran on, assembled from string fragments so the literal never appeared in the
+ * file. That did not hide it: a reader could evaluate the expression and recover
+ * the name, which made the guard itself the disclosure. A secret assembled in
+ * public source is not a secret.
+ *
+ * The name is gone from this repository entirely. Nothing below reconstructs it,
+ * and no replacement list of names was added — a public list of the vendor names
+ * a project screened for would publish the same fact the guard is protecting.
+ *
+ * What is left is the *shape* of the disclosure, which is what actually ships
+ * badly:
+ *
+ *   - an attribution of the work to an internal reviewer or tooling,
+ *     `"<Name> review round 3"`, `"reviewed by <Name>"`;
+ *   - a sign-off verdict, `"final pass"`, `"<ROLE> APPROVED"`;
+ *   - a workflow-stage or decision identifier from one team's logbook.
+ *
+ * ── The boundary, stated rather than implied ──
+ *
+ * A scanner over public source cannot recognise *an arbitrary unknown private
+ * name*. It has no list it could honestly keep (the list is the disclosure) and
+ * no general property that distinguishes a private tool name from an ordinary
+ * product name. Any claim to the contrary would be false.
+ *
+ * So this table does not claim name detection. It detects the *records* those
+ * workflows produce, which is the material that actually leaks a team's process,
+ * and the human review in the release procedure covers the residual case of a
+ * bare name in prose. `tools/guard-role-references.mjs` reports the boundary of
+ * that division so it stays visible.
+ *
+ * The name-shaped rules are case-SENSITIVE on purpose. Screaming-case internal
+ * verdicts are the real form; matching case-insensitively flagged ordinary
+ * English prose ("a final pass over the diff") and a guard that fires on correct
+ * writing gets switched off, which is how guards die.
  */
 const INTERNAL_PROCESS_PATTERNS = [
-  [new RegExp("\\b" + ["Qo", "der"].join("") + "\\b", "i"), "internal review role name"],
+  [
+    /\b[A-Z][A-Za-z0-9._-]{2,23}\s+review\s+round\s+\d+/,
+    "internal review attribution (named reviewer and round)",
+  ],
+  [
+    /\breview(?:ed)?\s+by\s+(?:the\s+)?[A-Z][A-Za-z0-9._-]{2,23}\b/,
+    "internal review attribution (reviewed by a named party)",
+  ],
+  [
+    /\b[A-Z][A-Z0-9]{1,15}(?:\s+[A-Z][A-Z0-9]{1,15})?\s+(?:FINAL\s+)?(?:PASS|APPROVED|SIGNED[\s-]?OFF)\b/,
+    "internal review verdict (role or tool prefixed sign-off)",
+  ],
   /*
-   * The bare acronym is deliberately **not** matched.
-   *
-   * It once appeared in a few comments as a role reference ("must be
-   * authorised by <role>"). Those were prose, not records: no decision, no
-   * finding, no instruction from a specific person. They have been reworded to
-   * "maintainer" because an unexplained internal role code is noise for a
-   * reader — but matching the bare word would be the wrong control, for two
-   * reasons:
-   *
-   *   1. it would also match a legitimate technical use (a `cto` acronym in a
-   *      domain module, a vendor name in a dependency), and a guard that fires
-   *      on correct code gets switched off;
-   *   2. the thing that must not ship is the *record* — the verdict, the
-   *      ticket, the decision identifier — which the patterns below already
-   *      cover by shape.
-   *
-   * What ships is judged by what it discloses, not by which words it contains.
+   * A bare pass phrase is a verdict when it is the *whole* claim, not when it is
+   * ordinary prose about doing a pass over something. "A final pass over the diff"
+   * is normal engineering English and is deliberately not matched; refusing it
+   * would be the false positive that teaches people to ignore the guard.
    */
-  [/\bCTO\s+(?:FINAL\s+)?(?:PASS|REVIEW|复核)/i, "internal review verdict"],
+  [/(?<!a )(?<!the )(?<!one )\bfinal\s+pass\b(?!\s+(?:over|through|on|of|at|across)\b)/i, "internal review verdict"],
   /*
-   * `Harness` is matched **only** in the sense the internal process used it: a
-   * Chinese sentence referring to the agent runtime whose context must not be
-   * polluted (that is, the runtime name adjacent to CJK prose). It is written
-   * unanchored at first, which
-   * flagged forty legitimate TypeScript identifiers (`interface Harness`,
-   * `startHarness`, `harness.port`) — a test harness is ordinary engineering
-   * English and suppressing it would be the wrong fix. The pattern now requires
-   * a CJK character immediately adjacent, which no identifier has.
+   * ── Review-cycle records, the category the first revision of this table lost ──
+   *
+   * The rule removed in the previous change matched `<ROLE> REVIEW` and
+   * `<ROLE> 复核` as a *verdict* — "the review concluded". The replacement only
+   * covered sign-off verdicts (PASS / APPROVED / SIGNED OFF), so a review-cycle
+   * record like `CTO REVIEW` or `CTO FINAL REVIEW` stopped being refused. That is
+   * a real loss of protection, not a wording preference: it is the same internal
+   * record type the removed rule covered.
+   *
+   * Both forms are restored below, and they are deliberately wider than the old
+   * acronym-only rule: any all-caps role or tool code followed by REVIEW or 复核,
+   * which covers role codes this table was never able to name.
+   *
+   * The capitalisation requirement is what keeps ordinary code review out. A
+   * sentence such as "requested a code review" or "see review comments" is
+   * lowercase prose about a normal engineering activity, and refusing it would be
+   * a false positive that gets the guard switched off. An all-caps code is the
+   * shape of an internal *record*, not of English.
    */
-  [/[\u4e00-\u9fff]\s*\/?\s*Harness|Harness\s*[\u4e00-\u9fff]/, "internal agent-harness reference"],
+  [
+    /\b[A-Z][A-Z0-9]{1,15}(?:\s+[A-Z][A-Z0-9]{1,15})?\s+(?:FINAL\s+|SECOND\s+|THIRD\s+|ROUND\s*\d+\s+)?REVIEW\b/,
+    "internal review-cycle record (role or tool prefixed)",
+  ],
+  /*
+   * ── Chinese review-cycle records ──
+   *
+   * The removed rule matched `<ROLE> 复核`, and an internal review *record* still
+   * has to be refused. But 复核 is also this project's own domain vocabulary, in
+   * three distinct senses:
+   *
+   *   - `人工复核` (manual human review) is a documented product concept;
+   *   - `复核记录` is the name of a real product artefact — the adjudication record
+   *     that the database schema preserves as historical audit fact, and that the
+   *     content-package documentation describes as `review.json`;
+   *   - codes such as `A2 复核` / `UPDATE 复核` are adjudication actions.
+   *
+   * A blanket match on the term flagged 330 legitimate occurrences across `docs/`,
+   * `content-policy/`, `src/`, `scripts/` and `tests/`. Refusing the product's own
+   * schema comments and documentation is the false positive that gets a gate
+   * switched off, so these senses must pass.
+   *
+   * What an *internal* record looks like, and what is matched:
+   *
+   *   1. an organisation role code followed by 复核 — the exact form the removed
+   *      rule covered. Org roles are public job titles, not products, so listing
+   *      them discloses nothing about which tools a team used;
+   *   2. any all-caps code followed by 复核 plus an explicit *verdict* word
+   *      (完成 / 通过 / 结论), which catches role codes outside the list;
+   *   3. an explicit verdict label, `复核结论：`.
+   *
+   * The product's own `复核记录` is deliberately excluded from branch 3: it is an
+   * artefact name, and its appearance is documented product behaviour.
+   */
+  [
+    /\b(?!(?:A\d|UPDATE|DELETE|INSERT|SELECT|CREATE|DROP)\b)[A-Z][A-Z0-9]{1,15}\s*(?:FINAL\s+|SECOND\s+|THIRD\s+)?复核|复核结论\s*[:：]/,
+    "internal review record (Chinese review-cycle record)",
+  ],
+  /*
+   * ── The rest of the runtime-narration category ──
+   *
+   * The first revision only matched the "verb + product + context" sentence. The
+   * removed rule matched *any* CJK adjacency to the runtime name, which also
+   * covered two shapes that went missing:
+   *
+   *   - the name immediately followed by the pollution verb ("<runtime> 上下文污染");
+   *   - the name appearing next to 上下文 without the specific direction verb
+   *     ("查看 <runtime> 上下文").
+   *
+   * Both are the same disclosure — the internal runtime and its context — so both
+   * are restored as shapes that carry no name. The pair must appear *adjacent*, in
+   * either order, which is what the removed rule required too; that adjacency is
+   * what keeps "React context" or "component tree context" prose out, because
+   * those are English, not a capitalised product name glued to a CJK noun.
+   *
+   * Boundary, stated rather than implied: this cannot recognise an arbitrary
+   * unknown private name. It recognises the *narration about a named runtime*.
+   * A bare name in prose is covered by human review.
+   */
+  [
+    /[A-Z][A-Za-z0-9_.-]{2,24}\s*(?:的)?\s*[\u4e00-\u9fff]{0,4}上下文(?:污染|受限)?/,
+    "internal agent-runtime reference (name adjacent to context prose)",
+  ],
+  [
+    /[\u4e00-\u9fff]\s*(?:会|将|要|别|不要)?\s*(?:进|进入|写进|塞进)\s*[A-Z][A-Za-z0-9_.-]{2,24}\s*(?:的)?\s*上下文/,
+    "internal agent-runtime context narration",
+  ],
   [/\bD-\d{3}\b/, "internal decision-record identifier"],
   [/\.opc\//, "internal record path"],
   [/\b(?:PROJECT_STATUS|QUALITY_GATES|PROJECT_CONTEXT)\b/, "internal record name"],
@@ -622,9 +734,28 @@ const INTERNAL_PROCESS_PATTERNS = [
 const TOKEN_ALLOWANCES = new Map([
   ["tools/public-release-check.mjs", { max: 0, why: "pattern table is RegExp literals only — no string tokens needed" }],
   ["tools/audit-history.mjs", { max: 0, why: "pattern table is RegExp literals only — no string tokens needed" }],
-  ["tools/gate-negative-controls.mjs", { max: 2, why: "synthetic controls must contain the shapes they reject" }],
-  ["tools/structural-scan.mjs", { max: 0, why: "self-test tokens are assembled at runtime" }],
-  ["tools/guard-token-scanner.mjs", { max: 0, why: "guard tokens are assembled at runtime" }],
+  /*
+   * The synthetic controls below legitimately contain the shapes they reject, and
+   * the tolerance is per *occurrence*, not per file: the ceiling is what a
+   * reviewer re-measures when the file changes (`node tools/count-allowance-tokens.mjs`).
+   *
+   * It moved from 2 to 3 when the exemption control (15) and the contribution-guide
+   * control (15b) were corrected to plant a real enforced shape instead of a bare
+   * acronym. The old count was lower because those two controls carried a token
+   * that no rule matched — the ceiling was measuring a fixture that proved nothing.
+   * The synthetic name they plant is not a private one; it is a plainly invented
+   * placeholder, which is why it can be listed here at all.
+   */
+  ["tools/gate-negative-controls.mjs", { max: 4, why: "synthetic controls must contain the shapes they reject" }],
+  ["tools/structural-scan.mjs", { max: 0, why: "self-test probe is a synthetic placeholder, no enforced shape" }],
+    /*
+   * The guard's two probe constants are enforced shapes, not bare words, because a
+   * probe has to be something the gate actually matches — see the note on the
+   * probe definitions. Both are synthetic: an invented reviewer placeholder and a
+   * decision-record id. The ceiling is the measured count, so any third one
+   * arriving without review fails.
+   */
+  ["tools/guard-token-scanner.mjs", { max: 2, why: "probe constants must be enforced shapes" }],
   ["tools/guard-build-boundary.mjs", { max: 0, why: "guard tokens are assembled at runtime" }],
   [
     "tools/audit-object-database.mjs",

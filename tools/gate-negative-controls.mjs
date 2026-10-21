@@ -212,6 +212,55 @@ function runGate(directory) {
   }
 }
 
+/**
+ * Run the gate and keep what it said.
+ *
+ * ── Why the exit code alone is not evidence ──
+ *
+ * Every control in this file used to assert only `exit !== 0`. A non-zero exit is
+ * produced by *anything* that goes wrong: a `ReferenceError` from a planted line
+ * that is not valid JavaScript, a missing file, a Git failure, an unhandled
+ * exception in a helper. A control written that way reports success when the tool
+ * crashes, which is not the property it claims to prove — it proves the process
+ * died, not that the privacy rule fired.
+ *
+ * This variant returns the combined output so a control can assert on the *reason*:
+ * the refusal must name the check it expected, and must not be a crash. A crash has
+ * no `[FAIL]` line and carries a stack trace; both are asserted against.
+ */
+function runGateDetailed(directory) {
+  try {
+    const stdout = execFileSync(
+      process.execPath,
+      ["--experimental-transform-types", join(directory, "tools", "public-release-check.mjs")],
+      { cwd: directory, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+    return { code: 0, output: stdout ?? "" };
+  } catch (error) {
+    return {
+      code: error.status ?? 1,
+      output: `${error.stdout ?? ""}${error.stderr ?? ""}`,
+    };
+  }
+}
+
+/**
+ * Assert a refusal happened *for the named reason*, not because the tool crashed.
+ *
+ * `expectedCheck` is the human-readable check title the gate prints, so a control
+ * cannot pass on an unrelated failure.
+ */
+function checkRefusedFor(output, expectedCheck) {
+  const failedChecks = [...output.matchAll(/\[FAIL\]\s+(.+)/g)].map((m) => m[1].trim());
+  const named = failedChecks.some((title) => title.includes(expectedCheck));
+  /*
+   * A crash shape: an uncaught exception or a module-load error. Neither can be
+   * evidence that a privacy rule ran.
+   */
+  const crashed = /\b(?:ReferenceError|SyntaxError|TypeError|ERR_MODULE_NOT_FOUND)\b/.test(output);
+  return { named, crashed, failedChecks };
+}
+
 // ── baseline: the synthetic tree must pass, or the controls prove nothing ──
 {
   const scratch = makeTree();
@@ -595,19 +644,33 @@ function runGate(directory) {
    * A forbidden token as executable code, not as a pattern literal. This is the
    * exact shape the exemption was supposed to cover and did not: a bare word in
    * code that no comment or string literal contains.
+   *
+   * ── Why the planted word is a shape and not a bare acronym ──
+   *
+   * This control used to plant a bare role acronym. That passed for the wrong
+   * reason: the acronym is *not* one of the enforced shapes (see the note in
+   * `INTERNAL_PROCESS_PATTERNS` about not matching a bare word), so the gate did
+   * not refuse it as a token — the planted line was a bare identifier, the module
+   * threw a ReferenceError, and the non-zero exit was read as a refusal. A
+   * control that passes because the tool crashed proves nothing about the scan.
+   *
+   * The planted text is now a real enforced shape — a review attribution — placed
+   * in an executable position, so the non-zero exit can only mean the token scan
+   * fired. `expectPlanted` still asserts the anchor was found.
    */
   const planted = original.replace(
     "const SKIP_DIRECTORIES = new Set([",
-    "const SKIP_DIRECTORIES = new Set([\n  // planted by the exemption control\n  CTO,",
+    'const SKIP_DIRECTORIES = new Set([\n  // planted by the exemption control\n  "Syntheticprobe review round 3",',
   );
   expectPlanted(planted, original);
   writeFileSync(exemptFile, planted, "utf8");
 
-  const code = runGate(scratch);
+  const { code, output } = runGateDetailed(scratch);
+  const { named, crashed } = checkRefusedFor(output, "no internal workflow tokens");
   check(
     "gate REFUSES a forbidden token appearing as code in an exempt file",
-    code !== 0,
-    `exit ${code}`,
+    code !== 0 && named && !crashed,
+    code === 0 ? "ACCEPTED — the exemption covered executable code" : crashed ? "CRASHED — this control was proving a ReferenceError, not a refusal" : "refused by a different check",
   );
   rmSync(scratch, { recursive: true, force: true });
 }
@@ -632,12 +695,38 @@ function expectPlanted(planted, original) {
  * interpolation, and a nested template.
  */
 {
-  const token = ["Qo", "der"].join("");
+  /*
+   * The probe is a full enforced shape, not a bare word.
+   *
+   * It has to be: the gate matches review attributions and sign-off verdicts by
+   * shape, not by a list of names (see the note in `INTERNAL_PROCESS_PATTERNS`).
+   * A bare invented word is not a violation, so planting one would have asserted
+   * "the gate refuses any identifier in a template" — which is not a rule this
+   * project has, and would have been a control that passes only if the gate were
+   * wrong.
+   */
+  const token = "Syntheticprobe review round 3";
 
+  /*
+   * Each shape must be *valid JavaScript* in which the forbidden token is present.
+   *
+   * This is what the previous version missed. It interpolated the raw token text
+   * into `${...}`, which makes the planted expression a bare phrase like
+   * `${Syntheticprobe review round 3}` — not a string, but three identifiers and a
+   * space. The module threw, the process exited non-zero, and the control read that
+   * as "the gate refused it". It was proving a ReferenceError, in the very control
+   * whose subject is that a token in a template is still seen.
+   *
+   * The interpolation now carries a *quoted string literal*, so the file parses and
+   * runs, and the only thing that can fail it is the scan. The paired assertion in
+   * the loop checks the refusal's stated reason and rejects a crash, so the defect
+   * cannot come back silently.
+   */
+  const quoted = JSON.stringify(token);
   const shapes = [
-    ["20a", `const v = \`${token} FINAL PASS\`;`, "literal text"],
-    ["20b", `const v = \`a\${${token}}b\`;`, "interpolation"],
-    ["20c", `const v = \`a\${\`b\${${token}}\`}c\`;`, "nested template"],
+    ["20a", `const v = \`${token}\`;`, "literal text"],
+    ["20b", `const v = \`a \${${quoted}} b\`;`, "interpolation"],
+    ["20c", `const v = \`a \${\`b \${${quoted}} c\`} d\`;`, "nested template"],
   ];
 
   for (const [id, line, label] of shapes) {
@@ -645,7 +734,22 @@ function expectPlanted(planted, original) {
       const target = join(dir, "tools", "public-release-check.mjs");
       writeFileSync(target, `${readFileSync(target, "utf8")}\n${line}\n`, "utf8");
     });
-    check(`control ${id}: gate REFUSES a token in a template (${label})`, runGate(scratch) !== 0);
+    const { code, output } = runGateDetailed(scratch);
+    /*
+     * The refusal must be the internal-process scan naming the attribution rule —
+     * not a crash, and not some other check that happened to go red. This is the
+     * difference between "the token was seen in a template" and "the module threw".
+     */
+    const { named, crashed } = checkRefusedFor(output, "no internal workflow tokens");
+    check(
+      `control ${id}: gate REFUSES a token in a template (${label})`,
+      code !== 0 && named && !crashed,
+      code === 0
+        ? "ACCEPTED — the token was invisible in this position"
+        : crashed
+          ? "CRASHED — non-zero exit was not produced by the token scan"
+          : "refused, but not by the internal-process check",
+    );
     rmSync(scratch, { recursive: true, force: true });
   }
 }
@@ -658,7 +762,7 @@ function expectPlanted(planted, original) {
  * documentation, and an allowance file may contain it.
  */
 {
-  const token = ["Qo", "der"].join("");
+  const token = "Syntheticprobe";
   const scratch = makeTree((dir) => {
     const target = join(dir, "docs", "note.md");
     mkdirSync(dirname(target), { recursive: true });
@@ -668,50 +772,44 @@ function expectPlanted(planted, original) {
   rmSync(scratch, { recursive: true, force: true });
 }
 
-// ── control 15b: the CONTRIBUTING exemption is provable too ──
+// ── control 15b: the contribution guide has no blanket skip ──
 //
-// The contribution guide is exempt from the internal-process scan because it
-// states the rules, and a rule stated as "do not write X" has to name X. The
-// exemption proof applies to it exactly as it does to the tools.
+// The contribution guide states the rules, so it is the file most likely to be
+// granted a blanket skip. It has none: its allowance is a **ceiling of 0**, so
+// any occurrence of an enforced shape in it must be refused — whether the text
+// sits in code or in prose.
 //
-// ── What this control plants, and why it changed  ──
+// ── What this control plants, and why it changed ──
 //
-// It used to plant a prose sentence and assert rejection. That no longer
-// discriminates: `CONTRIBUTING.md` now carries a **counted allowance** of 2
-// tokens (the two phrases it must name), and `makeTree` writes a *blank* guide —
-// so a single planted sentence lands at 1, comfortably under the ceiling, and the
-// gate accepts it correctly.
+// It used to plant a bare identifier and assert rejection. That stopped
+// discriminating twice over: the guide no longer needs to name any token, and a
+// bare identifier is not one of the enforced shapes, so the planted line was
+// simply an undefined name rather than a scan hit.
 //
-// Planting more sentences until the count trips would test counting, not the
-// proof. The property worth asserting is the one the exemption is about:
-// **a token that is code is rejected even when the file has allowance left.**
-// A bare identifier is code; a quoted rule is documentation. The control plants
-// the identifier into the real guide, which already sits at its ceiling, and
-// asserts rejection on the *class* rather than the count.
+// It now plants a real enforced shape into the real guide. The property asserted
+// is the one that matters for this file: prose in a `.md` file is reader-visible,
+// so a review attribution written there is a disclosure and must be refused.
 {
   const scratch = makeTree();
   const guide = join(scratch, "CONTRIBUTING.md");
 
   /*
-   * Copy the real guide so the file is at its documented allowance, then add a
-   * token as executable code. If the gate's classification were broken — the
-   * original family of defects — this would slip through on the remaining
-   * headroom.
+   * Copy the real guide so the planted sentence lands in the file whose exemption
+   * is in question, not in a placeholder that might behave differently.
    */
   copyFileSync(join(ROOT, "CONTRIBUTING.md"), guide);
   const original = readFileSync(guide, "utf8");
-  const token = ["Qo", "der"].join("");
-  writeFileSync(guide, `${original}\n\nconst note = ${token};\n`, "utf8");
+  writeFileSync(guide, `${original}\n\nSign-off: Syntheticprobe review round 3.\n`, "utf8");
 
-  const code = runGate(scratch);
+  const { code, output } = runGateDetailed(scratch);
+  const { named, crashed } = checkRefusedFor(output, "no internal workflow tokens");
   check(
-    "gate REFUSES a forbidden token appearing as code in the contribution guide",
-    code !== 0,
-    `exit ${code}`,
+    "gate REFUSES an enforced shape written into the contribution guide",
+    code !== 0 && named && !crashed,
+    code === 0 ? "ACCEPTED — a reader-visible phrase in the guide passed" : crashed ? "CRASHED" : "refused by a different check",
   );
   rmSync(scratch, { recursive: true, force: true });
 }
-
 // ── controls 16-18: the client-bundle check must cover server-side maps ──
 //
 // The defect class: a bundle check that scans only `.next/static/` and

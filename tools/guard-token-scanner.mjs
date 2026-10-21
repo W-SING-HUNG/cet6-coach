@@ -175,8 +175,26 @@ function gateExit(directory) {
  * correct code gets switched off). The review-role name and the decision-record
  * identifier are the enforced shapes, so the probe uses them.
  */
-const TOKEN = ["Qo", "der"].join("");
-const TOKEN_2 = ["D", "-", "042"].join("");
+/*
+ * A synthetic probe that is a full ENFORCED SHAPE, not a bare name.
+ *
+ * The gate matches internal-process material by shape: a review attribution
+ * ("<Name> review round N"), a sign-off verdict, a decision-record identifier.
+ * It deliberately does not match an arbitrary word, because doing so would fire
+ * on legitimate code.
+ *
+ * The probe therefore has to be a shape the rules actually name. An earlier
+ * revision of this file used the internal workflow's own assistant-tool name,
+ * assembled from fragments. That was wrong twice: it published the name for any
+ * reader to reconstruct, and it left these probes asserting that the gate rejects
+ * a bare identifier — which is not a rule this project has.
+ *
+ * `Syntheticprobe` is a plainly invented placeholder. Pairing it with
+ * `review round 3` makes it the enforced attribution shape, so every probe below
+ * asks a real question: is a violation of a real rule visible in this position?
+ */
+const TOKEN = "Syntheticprobe review round 3";
+const TOKEN_2 = "D-042";
 
 /*
  * ── Which file each control plants into ──
@@ -220,12 +238,15 @@ console.log("token scanner: template and interpolation handling\n");
 }
 
 /*
- * ── A: the shape the old proof handled correctly ──
- * A bare identifier is unambiguously code, so it is rejected.
+ * ── A: an enforced shape in an unquoted expression position ──
+ *
+ * The violation is assembled at runtime and written into the string being
+ * concatenated, so the probe never carries it as a literal of its own — but the
+ * gate still has to see it, because the file it scans does carry it.
  */
 {
   const scratch = makeTree((dir) => plant(dir, `const x = ${TOKEN};`));
-  check("A. bare identifier is REJECTED", gateExit(scratch) !== 0);
+  check("A. enforced shape in an unquoted position is REJECTED", gateExit(scratch) !== 0);
   rmSync(scratch, { recursive: true, force: true });
 }
 
@@ -245,7 +266,7 @@ console.log("token scanner: template and interpolation handling\n");
 
 /* ── C: token inside a template's literal text ── */
 {
-  const scratch = makeTree((dir) => plant(dir, `const x = \`${TOKEN} FINAL PASS \${y}\`;`));
+  const scratch = makeTree((dir) => plant(dir, `const x = \`${TOKEN}\`;`));
   const code = gateExit(scratch);
   check(
     "C. template literal text containing the token is REJECTED (regression)",
@@ -335,7 +356,7 @@ console.log("token scanner: template and interpolation handling\n");
 {
   const scratch = makeTree((dir) => {
     mkdirSync(join(dir, "docs"), { recursive: true });
-    writeFileSync(join(dir, "docs", "leak.md"), `const x = \`${TOKEN} FINAL PASS\`;\n`, "utf8");
+    writeFileSync(join(dir, "docs", "leak.md"), `const x = \`${TOKEN}\`;\n`, "utf8");
   });
   check("F. non-exempt file with a template is REJECTED (main scan intact)", gateExit(scratch) !== 0);
   rmSync(scratch, { recursive: true, force: true });

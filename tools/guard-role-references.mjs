@@ -1,19 +1,42 @@
 /**
- * Regression guard: internal-role references in product code.
+ * Regression guard: internal review attribution in product code.
  *
  * ── Why this is a separate check from the release gate ──
  *
- * The gate tolerates a bare role word in its own pattern documentation and in
+ * The gate tolerates a forbidden shape in its own pattern documentation and in
  * synthetic controls, because a scanner must contain what it searches for and a
  * control must contain the shape it rejects. That tolerance is correct but it
  * makes the gate unable to answer the narrower question a reviewer actually asks:
  *
- *     "did the *application* stop referring to an internal reviewer?"
+ *     "did the *application* stop attributing work to an internal reviewer?"
  *
  * So this probes the directories that constitute the shipped product and asserts
- * zero occurrences there, while explicitly recording the places where the word is
+ * zero occurrences there, while explicitly recording the places where the shape is
  * legitimate — so "we removed them all" is a claim with a stated boundary rather
  * than an overstatement.
+ *
+ * ── What changed, and why ──
+ *
+ * This guard used to search for the internal role code as a bare word. Two things
+ * were wrong with that:
+ *
+ *   1. The word is not itself a disclosure — it is an ordinary job title that
+ *      appears in legitimate engineering prose. What leaks is the *attribution*:
+ *      "reviewed by <name>", "<name> review round 3", a sign-off verdict.
+ *   2. Keeping the code in the file to search for it published the code. A guard
+ *      that has to spell out the secret is not protecting it.
+ *
+ * It now searches for the same enforced shapes the release gate uses. That is a
+ * *narrower* match per shape and a *broader* question overall: the product no
+ * longer needs a specific role name to be flagged for attributing its work to an
+ * internal reviewer.
+ *
+ * ── The boundary, stated ──
+ *
+ * This cannot detect an arbitrary unknown private name, and does not claim to:
+ * the list of names it would need is exactly the thing that must not ship. It
+ * detects attribution *records*. Naming a tool in prose without any attribution
+ * shape is covered by human review.
  *
  * Usage: node tools/guard-role-references.mjs
  */
@@ -25,22 +48,39 @@ import { join } from "node:path";
 const PRODUCT_DIRECTORIES = ["src", "tests", "e2e", "scripts"];
 
 /**
- * Directories where the word may legitimately appear, each with a reason.
+ * Directories where an enforced shape may legitimately appear, each with a reason.
  *
  * Reported rather than silently skipped: an allowance that is not listed is
  * indistinguishable from an oversight.
  */
 const ALLOWED_WITH_REASON = [
-  ["CONTRIBUTING.md", "states the rule, which requires naming what it forbids"],
-  ["tools/public-release-check.mjs", "explains which shapes are matched and why a bare word is not"],
+  ["CONTRIBUTING.md", "describes the excluded categories without naming a concrete token"],
+  ["tools/public-release-check.mjs", "defines the enforced shapes and why a bare word is not matched"],
   ["tools/audit-history.mjs", "documents the forbidden commit-message shapes"],
   ["tools/gate-negative-controls.mjs", "synthetic controls must contain the shapes they reject"],
-  ["tools/guard-token-scanner.mjs", "documents which token the probe uses and why"],
+  ["tools/guard-token-scanner.mjs", "the probe must be an enforced shape to be meaningful"],
   ["tools/structural-scan.mjs", "self-test fixtures"],
   ["tools/guard-source-doc-refs.mjs", "no occurrence expected; listed so a future one is reviewed"],
 ];
 
-const PATTERN = /\bCTO\b/;
+/**
+ * The enforced shapes, mirroring the release gate.
+ *
+ * Duplicated deliberately rather than imported: this probe must keep working if
+ * the gate's table is edited to be more permissive, and an import would silently
+ * import that looseness.
+ */
+const PATTERNS = [
+  /\b[A-Z][A-Za-z0-9._-]{2,23}\s+review\s+round\s+\d+/,
+  /\breview(?:ed)?\s+by\s+(?:the\s+)?[A-Z][A-Za-z0-9._-]{2,23}\b/,
+  /\b[A-Z][A-Z0-9]{2,15}\s+(?:FINAL\s+)?(?:PASS|APPROVED|SIGNED\s+OFF)\b/,
+  /\bfinal\s+pass\b/,
+];
+
+/** True when the text contains any enforced attribution/sign-off shape. */
+function containsEnforcedShape(text) {
+  return PATTERNS.some((pattern) => pattern.test(text));
+}
 
 function walk(directory, out = []) {
   let entries;
@@ -84,7 +124,7 @@ for (const directory of PRODUCT_DIRECTORIES) {
       continue;
     }
     productFiles += 1;
-    if (PATTERN.test(text)) productHits.push(file);
+    if (containsEnforcedShape(text)) productHits.push(file);
   }
 }
 
@@ -132,7 +172,7 @@ console.log("\ndocumented allowances (not part of the product):");
 for (const [file, reason] of ALLOWED_WITH_REASON) {
   let present = false;
   try {
-    present = PATTERN.test(readFileSync(file, "utf8"));
+    present = containsEnforcedShape(readFileSync(file, "utf8"));
   } catch {
     present = false;
   }
