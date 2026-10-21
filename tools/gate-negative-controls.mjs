@@ -990,6 +990,76 @@ function expectPlanted(planted, original) {
       rmSync(origin, { recursive: true, force: true });
     }
   }
+
+  /*
+   * ── control 25: editing an exempt tool must not fail the object audit ──
+   *
+   * The defect class: the object→path map was built from `HEAD` alone, while the
+   * "naming it is the function" exemption is looked up *by path*. The previous
+   * revision of an exempt file is still a reachable object and still contains the
+   * names its function requires, but it is not in `HEAD`, so it had no path, so
+   * the exemption could not apply. Result: **any** commit that merely reworded a
+   * comment in one of these tools failed the audit with "object contains '.opc/'",
+   * pointing at the superseded blob.
+   *
+   * That is worse than a normal false positive. It makes the gate fail on exactly
+   * the change a contributor is asked to make (fix a leak by editing the tool),
+   * and the only ways out are to delete the check or to stop editing the tools —
+   * both of which reduce safety. So the behaviour is pinned here.
+   *
+   * The baseline commit writes the exempt tool; the second commit edits one line.
+   * Both revisions contain the forbidden name, only the older one is out of HEAD.
+   */
+  {
+    const dir = mkdtempSync(join(tmpdir(), "audit-exempt-"));
+    try {
+      gitIn(dir, ["init", "-q"]);
+      gitIn(dir, ["config", "user.email", "maintainer@users.noreply.github.com"]);
+      gitIn(dir, ["config", "user.name", "CET6 Coach Maintainer"]);
+      gitIn(dir, ["config", "commit.gpgsign", "false"]);
+      mkdirSync(join(dir, "tools"), { recursive: true });
+      /*
+       * The forbidden name is assembled at runtime, the same way the neighbouring
+       * controls do it: this file is itself scanned, and planting the name as a
+       * literal here would spend the allowance that exists for the *controls*
+       * rather than documenting anything.
+       */
+      const RECORD_DIR = ["." , "opc", "/"].join("");
+      const tool = join(dir, "tools", "audit-history.mjs");
+      writeFileSync(tool, `// a scanner names what it refuses: "${RECORD_DIR}"\n`, "utf8");
+      gitIn(dir, ["add", "-A"]);
+      gitIn(dir, ["commit", "-q", "-m", "Initial public source distribution"]);
+
+      // The realistic edit: reword a comment in the exempt tool, touching nothing else.
+      writeFileSync(tool, `// a scanner names what it refuses: "${RECORD_DIR}" (reworded)\n`, "utf8");
+      gitIn(dir, ["add", "-A"]);
+      gitIn(dir, ["commit", "-q", "-m", "docs: reword a comment"]);
+
+      const { exitCode, output } = runObjectAudit(dir);
+      check(
+        "control 25: audit ACCEPTS a reworded exempt tool (superseded blob keeps its path)",
+        exitCode === 0,
+        `exit ${exitCode}${exitCode === 0 ? "" : ` — ${output.split("\n").find((l) => l.includes("object contains")) ?? ""}`}`,
+      );
+
+      /*
+       * The counterpart that stops control 25 from becoming "exempt everything":
+       * the same forbidden name in a file that is NOT on the list must still be
+       * refused, even though the map now covers every revision.
+       */
+      writeFileSync(join(dir, "src-leak.md"), `leaked record path: "${RECORD_DIR}"\n`, "utf8");
+      gitIn(dir, ["add", "-A"]);
+      gitIn(dir, ["commit", "-q", "-m", "test: plant a name outside the list"]);
+      const second = runObjectAudit(dir);
+      check(
+        "control 25b: audit still REFUSES the same name in a non-exempt file",
+        second.exitCode !== 0,
+        `exit ${second.exitCode}`,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
 }
 
 if (failures > 0) {

@@ -528,13 +528,44 @@ function record(id, title, violations, note = "") {
    * refuses X. Building the map once costs a single `ls-tree` and makes every
    * finding nameable — which is the difference between a report someone can act on
    * and one they have to investigate.
+   *
+   * ── Why every commit's tree, not just HEAD ──
+   *
+   * The map used to be built from `HEAD` alone. Combined with the exemption below
+   * — which is looked up *by path* — that produced a false failure the moment an
+   * exempt file was edited: the previous revision of the file is still a reachable
+   * object (and still contains the names its function requires), but it is no
+   * longer in `HEAD`, so it has no path, so the exemption cannot apply and the
+   * audit reports "object contains '.opc/'" against a commit that only reworded a
+   * comment. Every commit touching an exempt tool tripped it, which made the check
+   * unfixable-by-obedience and invited the usual "just delete the check" response.
+   *
+   * Mapping objects from **all** commits fixes that without weakening anything:
+   * a revision inherits its file's path, so an exempt tool's history is exempt for
+   * exactly the same reason its current revision is, and a forbidden name in a
+   * file that is *not* on the list is still a finding in every revision. The rule
+   * is about which file an object belongs to, not about which revision of it is
+   * currently checked out.
    */
   const pathByObject = new Map();
-  for (const line of git(["ls-tree", "-r", "--full-tree", "HEAD"]).split("\n")) {
-    const tab = line.indexOf("\t");
-    if (tab === -1) continue;
-    const meta = line.slice(0, tab).split(/\s+/);
-    pathByObject.set(meta[2], line.slice(tab + 1).replace(/\\/g, "/"));
+  const recordTree = (revision) => {
+    for (const line of git(["ls-tree", "-r", "--full-tree", revision]).split("\n")) {
+      const tab = line.indexOf("\t");
+      if (tab === -1) continue;
+      const meta = line.slice(0, tab).split(/\s+/);
+      const path = line.slice(tab + 1).replace(/\\/g, "/");
+      // First writer wins: `HEAD` is recorded first, so it keeps priority.
+      if (!pathByObject.has(meta[2])) pathByObject.set(meta[2], path);
+    }
+  };
+  recordTree("HEAD");
+  for (const revision of git(["rev-list", "--all"]).split("\n").filter(Boolean)) {
+    if (revision === "") continue;
+    try {
+      recordTree(revision);
+    } catch {
+      /* a revision whose tree cannot be read must not abort the audit */
+    }
   }
 
   const objects = git(["cat-file", "--batch-check", "--batch-all-objects"])
