@@ -626,7 +626,7 @@ const INTERNAL_PROCESS_PATTERNS = [
    * artefact name, and its appearance is documented product behaviour.
    */
   [
-    /\b(?:CTO|CEO|CFO|COO|QA|QC|LEAD|PM|PO|BA|SRE|SVP|VP)\s*(?:FINAL\s+|SECOND\s+|THIRD\s+)?复核|\b[A-Z][A-Z0-9]{1,15}\s*(?:FINAL\s+)?复核(?:完成|通过|结论)|复核结论\s*[:：]/,
+    /\b(?!(?:A\d|UPDATE|DELETE|INSERT|SELECT|CREATE|DROP)\b)[A-Z][A-Z0-9]{1,15}\s*(?:FINAL\s+|SECOND\s+|THIRD\s+)?复核|复核结论\s*[:：]/,
     "internal review record (Chinese review-cycle record)",
   ],
   /*
