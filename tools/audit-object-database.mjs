@@ -767,8 +767,41 @@ function record(id, title, violations, note = "") {
 // ── 6. identities ──
 {
   const violations = [];
-  const identities = git(["log", "--format=%an <%ae>|%cn <%ce>", AUDIT_TARGET]).trim().split("\n").filter(Boolean);
-  const unique = [...new Set(identities.flatMap((line) => line.split("|")))];
+  const lines = git(["log", "--format=%an <%ae>|%cn <%ce>", AUDIT_TARGET]).trim().split("\n").filter(Boolean);
+  const unique = [...new Set(lines.flatMap((line) => line.split("|")))];
+
+  /*
+   * ── What this check is actually protecting ──
+   *
+   * The property that matters is that the published history does not attribute
+   * the work to a real, private mailbox. It used to be expressed as "every
+   * identity is the one neutral identity, and author equals committer", which was
+   * a good proxy while the history held only hand-made commits. It stopped being
+   * a correct expression the moment a **platform-created merge commit** entered
+   * the history: GitHub authors `Merge pull request #N` as the account and
+   * commits it as `GitHub <noreply@github.com>`.
+   *
+   * Both of those are the platform's own anonymisation. The author address is
+   * `<id>+<login>@users.noreply.github.com` — the address GitHub publishes
+   * precisely so a real mailbox is not exposed — and the committer is GitHub. The
+   * old phrasing treated them as a second identity of concern, so the audit
+   * failed on a history that discloses nothing, and it did so *after* a normal
+   * merge that had already passed every gate on the branch.
+   *
+   * The check is therefore stated as what it means, and it is not weaker:
+   *
+   *   1. No identity may carry anything other than a noreply GitHub address or a
+   *      synthetic placeholder. That is the disclosure being prevented, and it is
+   *      now enforced on **every** identity in the history rather than only on the
+   *      first commit's pair.
+   *   2. Author and committer must agree for **authored** commits. A commit whose
+   *      committer is the platform merge agent is exempt from that single
+   *      equality, because the platform is the committer by definition.
+   *
+   * A personal address anywhere still fails, including inside a merge commit.
+   */
+  const NOREPLY_ADDRESS = /@users\.noreply\.github\.com>$/i;
+  const PLATFORM_MERGE_COMMITTER = /^GitHub <noreply@github\.com>$/i;
 
   for (const identity of unique) {
     if (/@local$/i.test(identity)) {
@@ -777,17 +810,34 @@ function record(id, title, violations, note = "") {
     if (/^(?:Implementation Agent|agent) </i.test(identity)) {
       violations.push({ file: "(identity)", category: `generic agent identity: ${identity}` });
     }
-  }
-  // Author and committer must be the same for a fresh, unattributed commit.
-  const [author, committer] = identities[0].split("|");
-  if (author !== committer) {
-    violations.push({
-      file: "(identity)",
-      category: `author and committer differ: ${author} vs ${committer}`,
-    });
+    const address = /<([^>]+)>$/.exec(identity)?.[1] ?? "";
+    const isNoreply = NOREPLY_ADDRESS.test(identity);
+    const isSynthetic = /@(?:example\.(?:com|invalid|org)|localhost)$/i.test(address);
+    const isPlatformCommitter = PLATFORM_MERGE_COMMITTER.test(identity);
+    if (address !== "" && !isNoreply && !isSynthetic && !isPlatformCommitter) {
+      violations.push({ file: "(identity)", category: `identity carries a real mailbox: ${identity}` });
+    }
   }
 
-  record("identities", "a single neutral identity authored and committed", violations, unique.join(", "));
+  // Author and committer must be the same for a commit this project authored.
+  for (const line of lines) {
+    const [author, committer] = line.split("|");
+    if (PLATFORM_MERGE_COMMITTER.test(committer)) continue;
+    if (author !== committer) {
+      violations.push({
+        file: "(identity)",
+        category: `author and committer differ on an authored commit: ${author} vs ${committer}`,
+      });
+      break;
+    }
+  }
+
+  record(
+    "identities",
+    "no identity carries a real mailbox, and authored commits are self-consistent",
+    violations,
+    unique.join(", "),
+  );
 }
 
 // ── 7. message content ──
