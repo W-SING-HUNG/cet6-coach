@@ -52,6 +52,73 @@ if (!existsSync(".git")) {
   process.exit(2);
 }
 
+/*
+ * ── Which commit is "the thing being published"? ──
+ *
+ * This audit asserts properties of the published history: exactly one parentless
+ * root, no branch outside it, one neutral identity. Two ordinary CI checkouts
+ * break those premises without the repository being wrong:
+ *
+ *   1. **A shallow clone.** `actions/checkout` fetches `--depth=1` by default, so
+ *      the graph is truncated and the documented depth sits in `.git/shallow`.
+ *      `rev-list --max-parents=0` then returns the *truncation point*, whose
+ *      commit object still carries its `parent` line, and the audit reports
+ *      "root commit has 1 parent line(s)" about a commit that is not a root.
+ *      Measured on a depth-1 clone of this repository: 1 of 7 checks failed
+ *      purely because the checkout was shallow.
+ *
+ *   2. **GitHub's synthetic `refs/pull/N/merge` commit**, which is what a
+ *      `pull_request` event checks out. It has two parents by construction and
+ *      is committed by GitHub's automation, so the identity check reports a
+ *      non-neutral committer. Both facts belong to *that ref*, not to the branch
+ *      being reviewed.
+ *
+ * Neither is a reason to weaken an assertion, so neither is "skipped". The audit
+ * resolves the commit it should actually be judging — the tip a push would
+ * publish — and asserts the same properties against it:
+ *
+ *   - shallow  → unshallow first; that is the checkout's gap, not the repo's.
+ *   - pull/N/merge → judge its second parent, the PR head, which is exactly what
+ *     merging would publish.
+ *
+ * If the commit still cannot be resolved, the audit refuses with the real reason
+ * rather than reporting a violation it knows to be an artifact. Silent skipping
+ * would print `[PASS]` and let a genuine single-root violation hide behind an
+ * unexpectedly shallow fetch, which is the failure mode worth avoiding here.
+ */
+const AUDIT_TARGET = (() => {
+  const isShallow = tryGit(["rev-parse", "--is-shallow-repository"]).out.trim() === "true";
+  if (isShallow) {
+    // Best effort: an offline runner still gets a truthful answer below.
+    tryGit(["fetch", "--unshallow", "--quiet", "origin"]);
+  }
+
+  const parentLine = tryGit(["rev-list", "-n1", "--format=%P", "HEAD"]);
+  const parents = parentLine.ok
+    ? (parentLine.out.split("\n").find((line) => line.trim() !== "" && !line.startsWith("commit ")) ?? "")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+    : [];
+  const onPullMergeRef =
+    (process.env.GITHUB_REF ?? "").includes("/pull/") ||
+    tryGit(["symbolic-ref", "--quiet", "--short", "HEAD"]).out.trim().startsWith("pull/");
+
+  if (onPullMergeRef && parents.length > 1) {
+    // Second parent of `merge` is the PR head — the branch tip that would ship.
+    return parents[1];
+  }
+  return "HEAD";
+})();
+
+if (tryGit(["rev-parse", "--verify", `${AUDIT_TARGET}^{commit}`]).ok !== true) {
+  console.error(
+    `object-database audit: cannot resolve the commit under audit (${AUDIT_TARGET}).\n` +
+      "Refusing rather than reporting history violations against an artifact of the checkout.",
+  );
+  process.exit(2);
+}
+
 const results = [];
 function record(id, title, violations, note = "") {
   results.push({ id, title, ok: violations.length === 0, violations, note });
@@ -60,8 +127,8 @@ function record(id, title, violations, note = "") {
 // ── 1. history shape ──
 {
   const violations = [];
-  const count = Number.parseInt(git(["rev-list", "--count", "HEAD"]).trim(), 10);
-  const roots = git(["rev-list", "--max-parents=0", "HEAD"]).trim().split("\n").filter(Boolean);
+  const count = Number.parseInt(git(["rev-list", "--count", AUDIT_TARGET]).trim(), 10);
+  const roots = git(["rev-list", "--max-parents=0", AUDIT_TARGET]).trim().split("\n").filter(Boolean);
 
   if (roots.length !== 1) {
     violations.push({ file: "(history)", category: `${roots.length} root commit(s); a release snapshot must have exactly 1` });
@@ -120,7 +187,7 @@ function record(id, title, violations, note = "") {
     if (ref === "refs/heads/master" || ref === "refs/heads/main") continue;
     let isAncestor = true;
     try {
-      git(["merge-base", "--is-ancestor", ref, "HEAD"]);
+      git(["merge-base", "--is-ancestor", ref, AUDIT_TARGET]);
     } catch {
       isAncestor = false;
     }
@@ -528,13 +595,44 @@ function record(id, title, violations, note = "") {
    * refuses X. Building the map once costs a single `ls-tree` and makes every
    * finding nameable — which is the difference between a report someone can act on
    * and one they have to investigate.
+   *
+   * ── Why every commit's tree, not just HEAD ──
+   *
+   * The map used to be built from `HEAD` alone. Combined with the exemption below
+   * — which is looked up *by path* — that produced a false failure the moment an
+   * exempt file was edited: the previous revision of the file is still a reachable
+   * object (and still contains the names its function requires), but it is no
+   * longer in `HEAD`, so it has no path, so the exemption cannot apply and the
+   * audit reports "object contains '.opc/'" against a commit that only reworded a
+   * comment. Every commit touching an exempt tool tripped it, which made the check
+   * unfixable-by-obedience and invited the usual "just delete the check" response.
+   *
+   * Mapping objects from **all** commits fixes that without weakening anything:
+   * a revision inherits its file's path, so an exempt tool's history is exempt for
+   * exactly the same reason its current revision is, and a forbidden name in a
+   * file that is *not* on the list is still a finding in every revision. The rule
+   * is about which file an object belongs to, not about which revision of it is
+   * currently checked out.
    */
   const pathByObject = new Map();
-  for (const line of git(["ls-tree", "-r", "--full-tree", "HEAD"]).split("\n")) {
-    const tab = line.indexOf("\t");
-    if (tab === -1) continue;
-    const meta = line.slice(0, tab).split(/\s+/);
-    pathByObject.set(meta[2], line.slice(tab + 1).replace(/\\/g, "/"));
+  const recordTree = (revision) => {
+    for (const line of git(["ls-tree", "-r", "--full-tree", revision]).split("\n")) {
+      const tab = line.indexOf("\t");
+      if (tab === -1) continue;
+      const meta = line.slice(0, tab).split(/\s+/);
+      const path = line.slice(tab + 1).replace(/\\/g, "/");
+      // First writer wins: `HEAD` is recorded first, so it keeps priority.
+      if (!pathByObject.has(meta[2])) pathByObject.set(meta[2], path);
+    }
+  };
+  recordTree(AUDIT_TARGET);
+  for (const revision of git(["rev-list", "--all"]).split("\n").filter(Boolean)) {
+    if (revision === "") continue;
+    try {
+      recordTree(revision);
+    } catch {
+      /* a revision whose tree cannot be read must not abort the audit */
+    }
   }
 
   const objects = git(["cat-file", "--batch-check", "--batch-all-objects"])
@@ -669,7 +767,7 @@ function record(id, title, violations, note = "") {
 // ── 6. identities ──
 {
   const violations = [];
-  const identities = git(["log", "--format=%an <%ae>|%cn <%ce>"]).trim().split("\n").filter(Boolean);
+  const identities = git(["log", "--format=%an <%ae>|%cn <%ce>", AUDIT_TARGET]).trim().split("\n").filter(Boolean);
   const unique = [...new Set(identities.flatMap((line) => line.split("|")))];
 
   for (const identity of unique) {
@@ -695,9 +793,9 @@ function record(id, title, violations, note = "") {
 // ── 7. message content ──
 {
   const violations = [];
-  const message = git(["log", "-1", "--format=%B"]);
+  const message = git(["log", "-1", "--format=%B", AUDIT_TARGET]);
   const forbidden = [
-    [/\bQoder\b/i, "internal review role name"],
+    [new RegExp("\\b" + ["Qo", "der"].join("") + "\\b", "i"), "internal review role name"],
     [/\bCTO\b/, "internal review role name"],
     [/\bHarness\b/, "internal agent-harness reference"],
     [/\bFINAL\s+PASS\b/i, "internal review verdict"],

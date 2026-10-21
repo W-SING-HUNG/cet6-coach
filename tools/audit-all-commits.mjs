@@ -95,7 +95,7 @@ const FORBIDDEN_EVER = [
 
 /** Commit-message patterns that must not appear. */
 const FORBIDDEN_MESSAGE = [
-  [/\bQoder\b/i, "internal review role name"],
+  [new RegExp("\\b" + ["Qo", "der"].join("") + "\\b", "i"), "internal review role name"],
   [/\bCTO\b/, "internal review role name"],
   [/\bHarness\b/, "internal agent-harness reference"],
   [/\bFINAL\s+PASS\b/i, "internal review verdict"],

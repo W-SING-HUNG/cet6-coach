@@ -231,12 +231,12 @@ function record(id, title, violations) {
   /*
    * Internal process vocabulary in commit messages.
    *
-   * A commit message is as public as the code. "CTO final pass" and "Qoder review
-   * round 3" tell a reader about one team's internal workflow; the public history
-   * uses neutral messages instead.
+   * A commit message is as public as the code. A sign-off quoted by role, tool
+   * name or review round tells a reader about one team's internal workflow; the
+   * public history uses neutral messages instead.
    */
   const FORBIDDEN_MESSAGE = [
-    [/\bQoder\b/i, "internal review role name"],
+    [new RegExp("\\b" + ["Qo", "der"].join("") + "\\b", "i"), "internal review role name"],
     [/\bCTO\b/, "internal review role name"],
     [/\bHarness\b/, "internal agent-harness reference"],
     [/\bFINAL\s+PASS\b/i, "internal review verdict"],

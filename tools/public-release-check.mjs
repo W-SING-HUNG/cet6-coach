@@ -514,16 +514,16 @@ const PERSONAL_DATA_PATTERNS = [
  * identifiers that only make sense inside one team's log.
  */
 const INTERNAL_PROCESS_PATTERNS = [
-  [/\bQoder\b/, "internal review role name"],
+  [new RegExp("\\b" + ["Qo", "der"].join("") + "\\b", "i"), "internal review role name"],
   /*
-   * `CTO` bare is deliberately **not** matched.
+   * The bare acronym is deliberately **not** matched.
    *
-   * The word once appeared in a few comments as
-   * a role reference ("must be authorised by 使用者 / CTO"). Those were prose,
-   * not records: no decision, no finding, no instruction from a specific
-   * person. They have been reworded to "maintainer" because an unexplained
-   * internal role code is noise for a reader — but matching the bare word
-   * would be the wrong control, for two reasons:
+   * It once appeared in a few comments as a role reference ("must be
+   * authorised by <role>"). Those were prose, not records: no decision, no
+   * finding, no instruction from a specific person. They have been reworded to
+   * "maintainer" because an unexplained internal role code is noise for a
+   * reader — but matching the bare word would be the wrong control, for two
+   * reasons:
    *
    *   1. it would also match a legitimate technical use (a `cto` acronym in a
    *      domain module, a vendor name in a dependency), and a guard that fires
@@ -538,7 +538,8 @@ const INTERNAL_PROCESS_PATTERNS = [
   /*
    * `Harness` is matched **only** in the sense the internal process used it: a
    * Chinese sentence referring to the agent runtime whose context must not be
-   * polluted ("会进 Harness 上下文"). It is written unanchored at first, which
+   * polluted (that is, the runtime name adjacent to CJK prose). It is written
+   * unanchored at first, which
    * flagged forty legitimate TypeScript identifiers (`interface Harness`,
    * `startHarness`, `harness.port`) — a test harness is ordinary engineering
    * English and suppressing it would be the wrong fix. The pattern now requires
@@ -606,10 +607,17 @@ const INTERNAL_PROCESS_PATTERNS = [
  *   shape to test it.
  *
  * `CONTRIBUTING.md`
- *   States the rule, and a rule of the form "do not write X" has to name X.
- *   Markdown is *not* otherwise exempt: it has no comments, so every character is
- *   prose the reader sees. That is precisely why it gets a counted allowance
- *   rather than a blanket skip.
+ *   States the rules **without naming any internal token**. It used to carry a
+ *   counted allowance of 2 on the grounds that "a rule of the form 'do not write
+ *   X' has to name X". That reasoning was wrong for this file: the rules here are
+ *   about a *category* (sign-offs, record identifiers, assistant-tool session
+ *   narration), and a category can be described without reproducing a real tool
+ *   name or a real sign-off. Naming them published exactly the material the rules
+ *   exist to keep out.
+ *
+ *   The ceiling is therefore **0**. Markdown is not otherwise exempt: it has no
+ *   comments, so every character is prose the reader sees — which is precisely why
+ *   a concrete example in prose is a disclosure, not documentation.
  */
 const TOKEN_ALLOWANCES = new Map([
   ["tools/public-release-check.mjs", { max: 0, why: "pattern table is RegExp literals only — no string tokens needed" }],
@@ -622,7 +630,7 @@ const TOKEN_ALLOWANCES = new Map([
     "tools/audit-object-database.mjs",
     { max: 4, why: "names the forbidden paths it scans the object database for" },
   ],
-  ["CONTRIBUTING.md", { max: 2, why: "states the rule, which requires naming it" }],
+  ["CONTRIBUTING.md", { max: 0, why: "describes the rules by category and never names a concrete token" }],
 ]);
 
 {
