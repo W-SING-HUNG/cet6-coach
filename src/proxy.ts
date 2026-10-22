@@ -64,77 +64,119 @@ export function proxy(request: NextRequest): NextResponse | undefined {
   }
 
   /*
-   * ── 规范访问地址引导（读请求）──
+   * ── 非规范回环主机名：一律拒绝（读与写都拒）──
    *
    * 回环的主机名不止一个：`127.0.0.1`、`localhost`、`[::1]`。它们都能连到
-   * 本服务，但在浏览器眼里是**不同来源**。敏感 POST 的同源守卫必须精确到
-   * 单一来源（见 `lib/loopback-guard.ts`），因此只有一个主机名能完成写操作。
+   * 本服务，但在浏览器眼里是**不同来源**。只有规范来源能完成写操作
+   * （见 `lib/loopback-guard.ts` 的精确判据）。
    *
-   * 上个版本的缺陷正在这里：README 让人打开 `localhost:3100`，而服务监听
-   * 并信任 `127.0.0.1:3100`。页面照常显示，点「确认阅读」时 POST 被 403
-   * 拒掉，界面只说"来源不是同一个本地服务" —— 既没说该换成哪个地址，
-   * 也没有任何恢复路径。功能看起来就是坏的。
+   * ── 为什么写请求必须在这里就拒，而不是留给下游 ──
    *
-   * ── 为什么这里**不**用重定向 ──
+   * 实测（Next 16.4.2，真实进程内服务器 + 原始 HTTP）：
+   * Next 自己的 Server Actions CSRF 门禁把 `Origin` 与 **`Host` 头**相比
+   * （`action-handler.js` 的 `parseHostHeader(req.headers)` 不传
+   * `originDomain`，于是直接采信客户端给的值）。当两者都写成同一个
+   * 别名（`Host: localhost:3265` + `Origin: http://localhost:3265`）时，
+   * 该门禁**通过**，action 正常执行并**写入了数据库**
+   * （实测：`weekday_minutes` 由 60 变为 137，`updated_at` 同步更新）。
    *
-   * 实测：Next 16 的 proxy 会用它自己的 `NextURL(Location, {headers})` 重建
-   * 目标地址，而那个构造器**用请求的 `Host` 头覆盖 URL 的主机名**；随后
-   * `adapter.js` 只在 `redirectURL.host === requestURL.host` 时才把 Location
-   * 相对化，于是我们想指定的规范主机名被丢掉，Location 变成相对路径
-   * （`/practice/courses`），浏览器解析回**同一个非规范主机名** ——
-   * 无限重定向（实测 ERR_TOO_MANY_REDIRECTS），页面彻底打不开。
-   * 也就是说：从 proxy 发起的跨主机名重定向在这版 Next 里做不到。
+   * 也就是说：别名的写通路**不是**理论推断，是实测存在的。下游端点
+   * 并非都像 `/api/course/reveal` 那样自己做精确 Origin 校验，因此
+   * 统一边界必须自己兜住 —— 这正是本文件存在的理由。
+   * 在这里拒绝，就不会有任何 action 被执行、不会产生任何数据库副作用。
    *
-   * ── 因此改成：一份**独立、无正文、可恢复**的引导页 ──
+   * ── 为什么读请求给引导页、写请求给纯文本 ──
    *
-   * 它满足三个要求，且都不依赖浏览器对非标准行为的容忍：
-   *   1. **清楚**：直说发生了什么、该用哪个地址；
-   *   2. **安全**：页面不读数据库、不含任何课程内容，也不反射 Host 头
-   *      （只回显可信来源，那是部署事实，不是用户输入）；
-   *   3. **可恢复**：给出指向规范地址的链接，路径与查询原样带过去，
-   *      点一下就回到正常界面。
-   *
-   * 用 421（Misdirected Request）：本服务确实无法为这个主机名服务，
-   * 语义准确，且浏览器会渲染响应体（也就是这份引导）。
-   *
-   * 只对读方法这样做。写方法**不**重定向、也不引导 —— 它们直接失败关闭，
-   * 由端点自己的守卫给出原因（用 307/308 转发写请求会把请求体一并送到，
-   * 等于替调用方完成了它本不该通过的来源判定）。
+   * 读请求的失败是"人走错了地址"，给一份可点的引导是安全且有用的。
+   * 写请求的失败**不应该**被渲染成页面（它不来自人肉导航），
+   * 因此返回简短纯文本 + 状态码，调用方从状态码即可判断。
    */
+
+  /** 规范来源（协议 + 主机名 + 端口）——**完全由部署配置决定**。 */
+  const canonical = new URL(trustedLocalOrigin());
+
   const method = request.method.toUpperCase();
   const isReadMethod = method === "GET" || method === "HEAD";
-  if (isReadMethod && !isCanonicalHostHeader(host ?? undefined)) {
-    const canonical = new URL(trustedLocalOrigin());
+
+  if (!isCanonicalHostHeader(host ?? undefined)) {
+    if (isReadMethod) {
+      /*
+       * ── 规范链接：**只**从 `trustedLocalOrigin()` 拼出 ──
+       *
+       * 历史缺陷（本轮修复）：上一版把 Host 头里的端口拿来拼引导链接，
+       * 于是 `Host: localhost:9999` 打在本服务上会生成
+       * `http://127.0.0.1:9999/...` —— 一个指向**另一项本地服务**的链接。
+       * 这不仅违背"可信来源不能来自客户端请求头"的设计原则，
+       * 而且会把使用者引导到别的进程上去（那看起来像是成功了）。
+       *
+       * 因此现在：协议、主机名、端口**三者全部**取自 `trustedLocalOrigin()`。
+       * 请求只能贡献经过处理的**路径与查询**。
+       *
+       * 多实例（开发 3100、E2E 3199~3265）仍然正确：每个实例都通过
+       * `PORT` 或 `CET6_LOCAL_ORIGIN` 声明自己的来源，`trustedLocalOrigin()`
+       * 因此返回**该实例自己**的端口，不是全局写死的 3100。
+       */
+      const canonicalUrl = `${canonical.origin}${safePathAndQuery(request)}`;
+      return canonicalAddressGuidance(canonicalUrl);
+    }
 
     /*
-     * 端口取自 Host 头，因此引导链接不会跨实例 —— 本产品会以多个端口启动
-     * （开发 3100、E2E 3199~3265），写死端口会把人送到另一个服务上。
+     * 写请求（POST / PUT / PATCH / DELETE 等）：失败关闭，不引导、
+     * 不转发、不执行。响应体不含任何私人内容。
      */
-    const portInHost = (() => {
-      const raw = host ?? "";
-      const separator = raw.lastIndexOf(":");
-      const bracket = raw.lastIndexOf("]");
-      // 只有 "]" 之后、且确实存在冒号时才是端口（IPv6 字面量里也有冒号）。
-      if (separator === -1 || (bracket !== -1 && separator < bracket)) return "";
-      const candidate = raw.slice(separator + 1);
-      return /^\d{1,5}$/.test(candidate) ? candidate : "";
-    })();
-
-    // 默认端口不写出来（`http://127.0.0.1:80` 与 `http://127.0.0.1` 同源）。
-    const isDefaultPort =
-      (canonical.protocol === "http:" && portInHost === "80") ||
-      (canonical.protocol === "https:" && portInHost === "443") ||
-      portInHost === "";
-    const authority = isDefaultPort ? canonical.hostname : `${canonical.hostname}:${portInHost}`;
-
-    // `request.nextUrl` 携带已解析的路径与查询，且不依赖 `request.url` 是绝对 URL。
-    const nextUrl = request.nextUrl;
-    const canonicalUrl = `${canonical.protocol}//${authority}${nextUrl.pathname}${nextUrl.search}`;
-
-    return canonicalAddressGuidance(canonicalUrl);
+    return new NextResponse("这个操作只能从本应用的规范本地地址发起。", {
+      status: 403,
+      headers: {
+        "content-type": "text/plain; charset=utf-8",
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+        "referrer-policy": "no-referrer",
+      },
+    });
   }
 
   return undefined;
+}
+
+/**
+ * 从请求中取出**可安全拼进 URL 的**路径与查询。
+ *
+ * ── 为什么不是直接拼 `request.nextUrl.pathname` ──
+ *
+ * 路径与查询是请求方唯一能贡献的部分，因此必须假定它是敌意的：
+ *
+ * - 以 `//` 开头会被浏览器解释成**协议相对 URL**（`//evil.example/x`
+ *   ⇒ `http://evil.example/x`），从而把引导链接变成开放重定向；
+ * - 含 `\` 的形态在部分解析器里同样被当作分隔符；
+ * - 控制字符与空白会被用来截断或混淆。
+ *
+ * 处理：拒绝不安全的形态并回退到 `/`，其余原样保留（保留是为了让
+ * "点一下就到原页面"这件事成立）。查询串只接受常规字符集。
+ */
+function safePathAndQuery(request: NextRequest): string {
+  const rawPath = request.nextUrl.pathname ?? "/";
+  const rawSearch = request.nextUrl.search ?? "";
+
+  /*
+   * 必须恰好以单个 `/` 开头：`//` 与 `/\` 都是协议相对 URL 的形态，
+   * 拼上 `canonical.origin` 之后会把主机名换掉。
+   */
+  const pathIsSafe =
+    rawPath.startsWith("/") &&
+    !rawPath.startsWith("//") &&
+    !rawPath.startsWith("/\\") &&
+    !rawPath.includes("\\") &&
+    !/[\u0000-\u001f\u007f]/.test(rawPath);
+
+  const path = pathIsSafe ? rawPath : "/";
+
+  // 查询串：`?` 开头，其余只允许 URL 查询里合法的字符。
+  const searchIsSafe =
+    rawSearch === "" ||
+    (rawSearch.startsWith("?") &&
+        !/[\u0000-\u001f\u007f\\]/.test(rawSearch));
+
+  return `${path}${searchIsSafe ? rawSearch : ""}`;
 }
 
 /**
@@ -171,9 +213,10 @@ function canonicalAddressGuidance(canonicalUrl: string): NextResponse {
   <h1>请改用规范地址打开本应用</h1>
   <p>本应用只接受从<strong>一个</strong>确定的本地地址发起的操作。本机浏览器会把
      <code>localhost</code> 与 <code>127.0.0.1</code> 当作两个不同来源，
-     因此用另一个名字打开时，"确认阅读"这类写操作会被安全地拒绝。</p>
+     因此用另一个名字打开时，保存类操作不会被接受。</p>
   <p><a href="${href}">${href}</a></p>
-  <p>这个链接会带你到同一页面。此后请一直使用这个地址；你的数据没有受到任何影响。</p>
+  <p>点这个链接即可在规范地址上继续使用；你的数据没有受到任何影响。
+     它不是自动跳转 —— 本应用不会替你把请求转发到另一个地址。</p>
 </main>
 </body>
 </html>

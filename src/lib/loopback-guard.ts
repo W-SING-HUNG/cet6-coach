@@ -128,8 +128,9 @@ export function isLoopbackHostHeader(hostHeader: string | undefined): boolean {
  *
  * ── 它与 `isTrustedHostHeader` 的分工 ──
  *
- * `isTrustedHostHeader` 是**写请求**（敏感 POST）的判据：Host 与 Origin 都
- * 必须精确等于可信来源。本函数不参与那条判定，它只用于**读请求的引导**。
+ * `isTrustedHostHeader` 是**写请求**（敏感 POST、Server Action）的判据：
+ * Host 与 Origin 都必须精确等于可信来源。本函数不参与那条判定 ——
+ * 它只是让 `proxy.ts` 能识别"这是同一服务的另一个名字"，从而给出引导。
  *
  * ── 为什么单列一个函数而不是放宽上面那个 ──
  *
@@ -138,9 +139,13 @@ export function isLoopbackHostHeader(hostHeader: string | undefined): boolean {
  * 于是课程揭示的 POST 被自己的同源守卫挡掉 —— 实测复现为
  * 403「来源不是同一个本地服务」，界面上表现为"看不到正文"，且没有恢复路径。
  *
- * 修法**不是**同时信任两个主机名（那会放松敏感 POST 的同源边界），
- * 而是让非规范主机名的读请求被**重定向到规范地址**：浏览器随后从
- * 规范来源发起，同源判定依然精确到单一来源。判据本身没有变宽。
+ * 修法**不是**同时信任两个主机名（那会放松写操作的同源边界），而是：
+ *
+ * - 读请求：返回一份**不自动跳转**的引导页，页面上的链接指向规范地址，
+ *   由使用者点一下（`proxy.ts` 的 `canonicalAddressGuidance`）；
+ * - 写请求：在统一边界直接 403，不转发、不执行、无数据库副作用。
+ *
+ * 判据本身没有变宽：别名在两个方向上都仍然**不被信任**。
  */
 export function isCanonicalHostHeader(hostHeader: string | undefined): boolean {
   if (hostHeader === undefined || hostHeader === "") return false;

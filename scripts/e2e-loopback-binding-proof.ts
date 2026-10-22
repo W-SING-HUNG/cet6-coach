@@ -102,17 +102,26 @@ function rawGet(
  *
  * 同 `rawGet` 的理由：这两个头都是禁止修改的请求头，只有底层
  * `node:http` 能真的把它们带上去。
+ *
+ * `extraHeaders` 用于 Server Action 形态的请求（需要 `next-action`）。
+ * 它排在默认头之后合并，因此调用方可以覆盖 `content-type`。
  */
 function rawPost(
   port: number,
   path: string,
-  options: { hostHeader: string; originHeader?: string; body: string },
+  options: {
+    hostHeader: string;
+    originHeader?: string;
+    body: string;
+    extraHeaders?: Record<string, string>;
+  },
 ): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const payload = Buffer.from(options.body, "utf8");
     const headers: Record<string, string> = {
       host: options.hostHeader,
       "content-type": "application/json",
+      ...options.extraHeaders,
       "content-length": String(payload.byteLength),
     };
     if (options.originHeader !== undefined) headers.origin = options.originHeader;
@@ -274,16 +283,17 @@ async function verifyInstance(label: string, port: number, probe: RevealProbe): 
   );
 
   /*
-   * ── ④b 回环别名的引导（本轮新增，规范访问地址）──
+   * ── ④b 回环别名的引导（规范访问地址）──
    *
    * 缺陷回顾：README 让人打开 `localhost:<port>`，而服务监听并信任
    * `127.0.0.1:<port>`。页面照常显示，点「确认阅读」时 POST 被 403 ——
-   * 没有任何恢复路径。这里对**真实的 Next 服务器**验证修复后的三件事，
+   * 没有任何恢复路径。这里对**真实的 Next 服务器**验证修复后的四件事，
    * 且都用原始 `Host` 头（浏览器无法伪造该头）：
    *
    * 1. 别名读请求得到**清楚的结果**（不是一张看似正常的页面）；
    * 2. 该结果里给出**规范地址**的链接，且链接指向同一个端口（不跨实例）；
-   * 3. 该结果**不含任何课程正文** —— 引导页不是内容出口。
+   * 3. 该结果**不含任何课程正文** —— 引导页不是内容出口；
+   * 4. **Host 头里的端口不能改变链接端口** —— 见 ④c。
    */
   if (LOOPBACK_HOST === "127.0.0.1") {
     const aliasHost = `localhost:${port}`;
@@ -308,19 +318,70 @@ async function verifyInstance(label: string, port: number, probe: RevealProbe): 
     );
 
     /*
-     * 端口必须沿用请求自己的那一个：把端口写死成可信来源里的值，
-     * 在端口与配置不一致时会把使用者送到**另一个服务**上。
-     * 这里验证链接里的端口就是本实例实际监听的端口。
+     * ── ④c Host 头端口伪造（本轮修复的核心负向控制）──
+     *
+     * 历史缺陷：引导链接的端口取自 `Host` 头，于是
+     * `Host: localhost:9999` 打在本服务上会生成指向 `http://127.0.0.1:9999/...`
+     * 的链接 —— 那是**另一项本地服务**。这既违背"可信来源不来自请求头"
+     * 的原则，也会把使用者引导到别的进程上（且看起来像成功了）。
+     *
+     * 判据：换任意伪端口，链接的 authority 必须**始终**等于本实例的
+     * 可信来源，一个字都不变。
      */
+    const expectedOrigin = `http://${LOOPBACK_HOST}:${port}`;
+    const spoofedPorts = ["3250", "9999", "1", "65535"];
+    const spoofFailures: string[] = [];
+
+    for (const spoofed of spoofedPorts) {
+      const spoofedPage = await rawGet(port, "/practice/courses", `localhost:${spoofed}`);
+      const linkMatch = /<a href="([^"]+)"/.exec(spoofedPage.body);
+      const link = linkMatch ? linkMatch[1] : "";
+      const usesTrustedOrigin = link.startsWith(`${expectedOrigin}/`);
+      const leaksSpoofedPort = link.includes(`:${spoofed}/`) && spoofed !== String(port);
+      if (!usesTrustedOrigin || leaksSpoofedPort) {
+        spoofFailures.push(`Host 端口 ${spoofed} ⇒ ${link || "(无链接)"}`);
+      }
+    }
+
     check(
-      "引导链接与本实例同端口（不跨实例）",
-      aliasPage.body.includes(`:${port}/`),
-      "引导链接里的端口与本实例不一致",
+      "Host 头里的伪端口**不能**改变引导链接的端口",
+      spoofFailures.length === 0,
+      spoofFailures.join(" ; "),
     );
 
     /*
-     * 别名 Host + 规范 Origin 的写请求必须仍然被拒 —— 证明"引导"
-     * 没有顺手放松同源判定（Host 判定在最前面）。
+     * 缺端口的 Host（`localhost` 不带端口）同样不得让链接丢掉端口 ——
+     * 那会让链接指向默认端口 80，又是一个"另一项服务"。
+     */
+    const noPortPage = await rawGet(port, "/practice/courses", "localhost");
+    const noPortLink = (/<a href="([^"]+)"/.exec(noPortPage.body) ?? [])[1] ?? "";
+    check(
+      "Host 头缺端口时引导链接仍带本实例端口",
+      noPortLink.startsWith(`${expectedOrigin}/`),
+      noPortLink || "(无链接)",
+    );
+
+    /*
+     * 路径/查询必须仍然被带过去（可恢复性），但**只能**是路径与查询 ——
+     * 协议相对形态（`//host`）不得把链接变成开放重定向。
+     */
+    const withQuery = await rawGet(port, "/practice/courses?x=1&y=2", `localhost:${port}`);
+    check(
+      "引导链接保留路径与查询",
+      withQuery.body.includes(`${expectedOrigin}/practice/courses?x=1`),
+      "路径或查询丢失",
+    );
+
+    check(
+      "引导链接不是协议相对 URL（不改主机名）",
+      !/<a href="\/\//.test(withQuery.body),
+      "出现了以 // 开头的链接，可被解释为协议相对 URL",
+    );
+
+    /*
+     * 别名 Host 的写请求必须被拒 —— 且现在是在**统一 Proxy 层**就拒，
+     * 不依赖下游端点自己校验。这条用敏感端点验证（它的下游守卫最严），
+     * Server Actions 那一类在 ④d 单独验证。
      */
     const aliasWrite = await rawPost(port, "/api/course/reveal", {
       hostHeader: aliasHost,
@@ -336,6 +397,54 @@ async function verifyInstance(label: string, port: number, probe: RevealProbe): 
       "回环别名 Host 的写请求 ⇒ 仍被拒（引导不放宽同源边界）",
       aliasWrite.status === 403,
       `状态 ${aliasWrite.status}`,
+    );
+
+    /*
+     * ── ④d Server Action 写通路（本轮实测发现）──
+     *
+     * Next 16.4.2 的 Server Actions CSRF 门禁把 `Origin` 与 **`Host` 头**
+     * 相比，且 `Origin` 缺失时只记警告就放行（见
+     * `action-handler.js` 的 `parseHostHeader`/`handleAction`）。
+     * 于是"别名 Host + 别名 Origin"能**通过**那道门禁 ——
+     * 实测曾真的写进数据库。因此必须由统一 Proxy 层拒绝。
+     *
+     * 这里用 POST 打一个 action 路径（不带合法 action id 也无所谓：
+     * 判据是"在到达 action 分发之前就被拒"，状态码 403 而非 500/400）。
+     */
+    const aliasActionWrite = await rawPost(port, "/settings", {
+      hostHeader: aliasHost,
+      originHeader: `http://${aliasHost}`,
+      body: "[]",
+      extraHeaders: {
+        "next-action": "0".repeat(40),
+        "content-type": "text/plain;charset=UTF-8",
+      },
+    });
+    check(
+      "回环别名 Host 的 Server Action 写请求 ⇒ 统一边界拒绝（403）",
+      aliasActionWrite.status === 403,
+      `状态 ${aliasActionWrite.status}（若是 200/400/500 说明请求进了 action 层）`,
+    );
+    check(
+      "被拒的 Server Action 写请求不含任何页面正文",
+      !aliasActionWrite.body.includes(probe.expectedText),
+      "响应体里出现了课程正文",
+    );
+
+    /* 规范来源下的同一路径必须是"能进到 action 层"（证明拦截是精确的）。 */
+    const canonicalActionWrite = await rawPost(port, "/settings", {
+      hostHeader: `${LOOPBACK_HOST}:${port}`,
+      originHeader: `http://${LOOPBACK_HOST}:${port}`,
+      body: "[]",
+      extraHeaders: {
+        "next-action": "0".repeat(40),
+        "content-type": "text/plain;charset=UTF-8",
+      },
+    });
+    check(
+      "规范来源的同一写请求未被统一边界拦截（拦截只针对别名）",
+      canonicalActionWrite.status !== 403,
+      `状态 ${canonicalActionWrite.status}`,
     );
   }
 

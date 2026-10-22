@@ -94,14 +94,22 @@ other local projects) and binds **loopback only**, so open
 <http://127.0.0.1:3100>.
 
 > **Use `127.0.0.1`, not `localhost`.** Both names reach the same server, but a
-> browser treats them as two different origins. State-changing requests (the
-> course reveal endpoint in particular) are accepted only from the exact origin
-> the server reports as trusted, which is `127.0.0.1`. Opening
-> `http://localhost:3100` is redirected to the canonical address for ordinary
-> page loads; a write that somehow still arrives from the other name is refused
-> with a message telling you which address to use. This is deliberate: accepting
-> both names would mean accepting two origins for the one request that releases
-> private study content.
+> browser treats them as two different origins, and only one origin can be the
+> trusted one. That origin is `127.0.0.1`.
+>
+> What happens if you open the other name:
+>
+> - **Page loads are not redirected.** You get a short page explaining the
+>   situation, with a link to the same page on the canonical address. The link
+>   uses the address this instance is actually configured to serve (so a
+>   development instance and an E2E instance each point at themselves), and it
+>   carries only the path and query — never the port from your `Host` header.
+> - **Saving actions are refused.** Nothing is forwarded, and nothing is
+>   written. Click the link, then repeat the action on the canonical address.
+>
+> This is deliberate. Accepting both names would mean accepting two origins for
+> the same set of writes, including the one request that releases private study
+> content.
 
 On first load, `/` redirects through `/onboarding` → `/diagnostic` → `/today`.
 
