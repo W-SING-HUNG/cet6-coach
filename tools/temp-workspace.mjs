@@ -132,28 +132,107 @@ let exitHookInstalled = false;
 let finalising = false;
 
 /**
- * A cleanup failure, carrying the path so a caller can act on it.
+ * Error codes that are safe to print.
  *
- * Kept as an `Error` subclass so `withTempDir` propagates something a test can
- * assert on, and so the exit handler can distinguish it from an unrelated throw.
+ * A whitelist rather than a blacklist: an unrecognised code becomes the generic
+ * `CLEANUP_FAILED`, so a future Node version introducing a code that embeds a path
+ * cannot start leaking through this channel. The set is exactly the outcomes a
+ * directory removal can produce.
+ */
+const SAFE_ERROR_CODES = new Set([
+  "EACCES",
+  "EBUSY",
+  "EEXIST",
+  "EISDIR",
+  "EMFILE",
+  "ENOENT",
+  "ENOTDIR",
+  "ENOTEMPTY",
+  "EPERM",
+  "EROFS",
+  "CLEANUP_FAILED",
+]);
+
+/**
+ * Reduce anything thrown by the filesystem to a **safe error code**.
+ *
+ * ── Why the message is not used ──
+ *
+ * A Node filesystem error carries `<CODE>: <description>, <syscall> '<absolute path>'`
+ * in its `message`, plus `errno`, `syscall` and `path` properties. That absolute
+ * path is `<home>/AppData/Local/Temp/...` on Windows and `/home/<runner>/...` on
+ * Linux — the account name. Redacting only the `displayPath` argument was
+ * therefore not enough: the leak arrived through the *cause*, and through the
+ * `stack`, which embeds the message.
+ *
+ * Only `code` survives, and only when it is on the allow-list above. Everything
+ * else about the original error — message, path, errno, syscall, stack, the object
+ * itself — is deliberately dropped. Nothing downstream can re-expose what was never
+ * retained.
+ *
+ * @param {unknown} error
+ * @returns {string}
+ */
+function safeErrorCode(error) {
+  if (typeof error === "object" && error !== null) {
+    const code = /** @type {{ code?: unknown }} */ (error).code;
+    if (typeof code === "string" && SAFE_ERROR_CODES.has(code)) return code;
+  }
+  return "CLEANUP_FAILED";
+}
+
+/**
+ * A cleanup failure, carrying a **redacted** display path and a safe error code.
+ *
+ * ── What this error must never contain ──
+ *
+ * The previous revision redacted `displayPath` but then concatenated
+ * `cause.message` into the message and kept the whole `cause` object on the error.
+ * A Node filesystem error's message embeds the absolute path it failed on, so the
+ * full account-bearing path reappeared in:
+ *
+ *   - `error.message`
+ *   - `error.stack` (which prefixes the message)
+ *   - `error.cause.message`
+ *   - `JSON.stringify(error)`
+ *   - `util.inspect(error)` in a console dump or a test failure
+ *
+ * The error is now built **only** from a safe code and the redacted leaf name.
+ * The original cause is not stored at all — not under `cause`, not as a property,
+ * not in a closure that `inspect` could reach — because the only thing that would
+ * be gained from it is the path we are trying to keep out of the log.
+ *
+ * Semantics preserved: this is still a real `Error` subclass, still thrown, and
+ * still makes the process exit non-zero. Privacy is achieved by removing the
+ * sensitive *data*, never by swallowing the failure or resetting an exit code.
  */
 export class TempCleanupError extends Error {
   /**
-   * @param {string} display        redacted path, safe to print
-   * @param {Error | undefined} cause
+   * @param {string} display safe, already-redacted identifier
+   * @param {unknown} [cause] inspected for a safe code only, then discarded
+   * @param {string} [codeOverride] pre-validated code, for callers that already
+   *   reduced the failure themselves and therefore have no cause to pass
    */
-  constructor(display, cause) {
-    const detail =
-      cause instanceof Error
-        ? `${cause.code ?? cause.name}: ${cause.message}`
+  constructor(display, cause, codeOverride) {
+    const code =
+      codeOverride !== undefined
+        ? SAFE_ERROR_CODES.has(codeOverride)
+          ? codeOverride
+          : "CLEANUP_FAILED"
         : cause === undefined
-          ? "path is still present after removal"
-          : String(cause);
-    super(`temporary workspace could not be removed: ${display} — ${detail}`);
+          ? "CLEANUP_FAILED"
+          : safeErrorCode(cause);
+    super(`temporary workspace could not be removed: ${display} (${code})`);
     this.name = "TempCleanupError";
-    /** Redacted form; the raw path is deliberately not stored on the error. */
+    /** Redacted identifier: `<temp>/<mkdtemp leaf>`. Never an absolute path. */
     this.displayPath = display;
-    if (cause !== undefined) this.cause = cause;
+    /** Whitelisted code only. */
+    this.code = code;
+    /*
+     * `cause` is intentionally NOT assigned. Assigning it would put the raw
+     * filesystem error back within reach of `inspect`, `JSON.stringify` and any
+     * structured dump, which is the leak this class exists to prevent.
+     */
   }
 }
 
@@ -190,14 +269,27 @@ function redactTempPath(path) {
  *
  * @param {string} path
  * @param {(path: string) => boolean} existsFn injected so tests can force failure
- * @returns {{ removed: boolean, error?: Error }}
+ * @param {(path: string) => void} [removeFn] injected so a test can raise a real
+ *   filesystem error (one that embeds an absolute path) without needing an
+ *   actually undeletable directory, which is not reliably constructible across
+ *   Windows locks / POSIX permissions / root.
+ * @returns {{ removed: boolean, error?: unknown }}
  */
-function removeWithRetry(path, existsFn) {
+function removeWithRetry(path, existsFn, removeFn) {
   const attempts = 5;
   let lastError;
+  /*
+   * The real removal keeps the recursive/retry options; an injected one is called
+   * exactly as given. Defaulting this parameter to bare `rmSync` would drop the
+   * options object and fail every normal removal — so the default is a closure
+   * that supplies them.
+   */
+  const remove =
+    removeFn ??
+    ((target) => rmSync(target, { recursive: true, force: true, maxRetries: 3, retryDelay: 40 }));
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      rmSync(path, { recursive: true, force: true, maxRetries: 3, retryDelay: 40 });
+      remove(path);
     } catch (error) {
       lastError = error;
     }
@@ -271,15 +363,18 @@ function installExitHook() {
  * the previous revision.
  *
  * @param {string} prefix
- * @param {{ exists?: (path: string) => boolean }} [options]
- *   Test seam. `exists` lets a test force "the path is still there" without
- *   needing an actually undeletable directory — which is not reliably constructible
- *   on every platform (Windows file locks and POSIX permission bits differ).
+ * @param {{ exists?: (path: string) => boolean, remove?: (path: string) => void }} [options]
+ *   Test seams. `exists` lets a test force "the path is still there"; `remove` lets
+ *   a test raise a genuine filesystem error (the kind whose message embeds an
+ *   absolute path) without needing an actually undeletable directory — which is not
+ *   reliably constructible on every platform (Windows file locks and POSIX
+ *   permission bits differ, and root ignores permission bits entirely).
  * @returns {{ path: string, dispose: () => void }}
  */
 export function createTempDir(prefix, options = {}) {
   installExitHook();
   const existsFn = options.exists ?? existsSync;
+  const removeFn = options.remove;
   const created = mkdtempSync(join(tmpdir(), prefix));
   /*
    * Keyed by the path `mkdtempSync` returned, which is the only path the caller and
@@ -302,7 +397,7 @@ export function createTempDir(prefix, options = {}) {
     dispose() {
       if (disposed) return;
       disposed = true;
-      const { removed, error } = removeWithRetry(created, existsFn);
+      const { removed, error } = removeWithRetry(created, existsFn, removeFn);
       if (removed) {
         outstanding.delete(created);
         return;
@@ -310,6 +405,9 @@ export function createTempDir(prefix, options = {}) {
       /*
        * Leave the entry registered so the exit handler makes one more attempt, and
        * throw so the caller cannot mistake this for success.
+       *
+       * Only the redacted identifier and a whitelisted code reach the error; the
+       * filesystem error itself is discarded by the constructor.
        */
       throw new TempCleanupError(redactTempPath(created), error);
     },
@@ -331,7 +429,7 @@ export function createTempDir(prefix, options = {}) {
  * @template T
  * @param {string} prefix
  * @param {(path: string) => T} body
- * @param {{ exists?: (path: string) => boolean }} [options]
+ * @param {{ exists?: (path: string) => boolean, remove?: (path: string) => void }} [options]
  * @returns {T}
  */
 export function withTempDir(prefix, body, options = {}) {
@@ -371,7 +469,7 @@ export function withTempDir(prefix, body, options = {}) {
  * @template T
  * @param {string} prefix
  * @param {(path: string) => Promise<T>} body
- * @param {{ exists?: (path: string) => boolean }} [options]
+ * @param {{ exists?: (path: string) => boolean, remove?: (path: string) => void }} [options]
  * @returns {Promise<T>}
  */
 export async function withTempDirAsync(prefix, body, options = {}) {

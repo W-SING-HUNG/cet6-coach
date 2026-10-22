@@ -1,5 +1,6 @@
 import { describe, expect, it, beforeEach, afterAll, afterEach } from "vitest";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { TempCleanupError } from "../tools/temp-workspace.mjs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -76,62 +77,157 @@ const ORIGINAL_CONTENT_ROOT = process.env.CET6_CONTENT_ROOT;
  */
 afterEach(() => {
   /*
-   * ── Close the native handle BEFORE deleting files ──
+   * ── Structure: every step must run even if an earlier one fails ──
    *
-   * `DatabaseSync` holds a native handle, and the previous code closed only the
-   * final one in `afterAll`: every per-test handle leaked for the life of the
-   * file. Beyond the leak, on Windows an open handle keeps the containing
-   * directory busy, so deleting the tree while a handle is open is exactly how a
-   * cleanup fails intermittently. Closing first makes the ordering correct rather
-   * than lucky.
+   * The previous version ran close → assertRemoved → restoreEnv in sequence. When
+   * `assertRemoved` threw, the environment restore never executed, so
+   * `CET6_CONTENT_ROOT` stayed pointing at the doomed per-test directory —
+   * measured: after a failed cleanup the variable held the test's own path instead
+   * of the pre-test value (or instead of being absent). Every later test in that
+   * worker then saw a different environment than it started with.
    *
-   * The close itself is not a verdict about the test, so a double-close is
-   * tolerated — but any *other* close failure is surfaced by the removal step
-   * below, which will find the directory still busy.
+   * A `finally` is the reliable structure, and it is deliberately outermost: the
+   * environment restore must not depend on whether the database closed or the
+   * directory was removed. Failures are collected rather than replacing each
+   * other, so the original verdict and the cleanup evidence both survive.
+   *
+   * Ordering is also deliberate: the native handle closes **before** the tree is
+   * deleted, because on Windows an open handle keeps the containing directory busy
+   * and that is precisely how such a removal fails intermittently.
    */
+  let failure: unknown;
+
+  /* 1. Close the native handle first. */
+  try {
+    closeDatabaseHandle();
+  } catch (error) {
+    failure = error;
+  }
+
+  /* 2. Remove the directory, preserving ownership if it survives. */
+  try {
+    if (repoDir) {
+      assertRemoved(repoDir);
+      /* Cleared only once verifiably gone, so a leftover stays registered. */
+      repoDir = "";
+    }
+  } catch (error) {
+    if (failure === undefined) {
+      failure = error;
+    } else {
+      /* Both failed: keep the original as primary, retain the secondary too. */
+      attachSecondaryError(failure, error);
+    }
+  } finally {
+    /* 3. Restore the environment — unconditionally, whatever happened above. */
+    restoreContentRootEnv();
+  }
+
+  if (failure !== undefined) throw failure;
+});
+
+/**
+ * Close the SQLite handle, distinguishing "already closed" from a real fault.
+ *
+ * `db.close()` on an already-closed handle is expected here (the `afterAll` sweep
+ * closes it again), so that specific condition is tolerated. Any *other* error is
+ * real and must not be swallowed: the previous `catch {}` hid every failure,
+ * including ones that would explain a later removal failure.
+ */
+function closeDatabaseHandle(): void {
   try {
     db?.close();
-  } catch {
-    /* already closed; the removal below is what decides success */
-  }
-
-  if (repoDir) {
+  } catch (error) {
     /*
-     * Throwing here is deliberate: it makes the test fail. The shared helper keeps
-     * the path registered, so the exit hook retries — ownership is not lost.
+     * `node:sqlite` raises this for a handle that is already closed. Tolerate only
+     * that shape; re-raise everything else so a genuine fault is not masked.
      */
-    assertRemoved(repoDir);
-    repoDir = "";
+    const code = (error as { code?: unknown } | null)?.code;
+    const message = error instanceof Error ? error.message : "";
+    const alreadyClosed =
+      code === "ERR_INVALID_STATE" || /database is not open|already closed/i.test(message);
+    if (!alreadyClosed) throw error;
   }
+}
 
+/**
+ * Restore `CET6_CONTENT_ROOT` to exactly what it was before the file ran.
+ *
+ * Deleting it unconditionally was wrong whenever the surrounding shell exported it:
+ * that destroys state this file never owned. Restoring the captured value (or
+ * deleting when it was absent) is the only form correct in both cases.
+ */
+function restoreContentRootEnv(): void {
   if (ORIGINAL_CONTENT_ROOT === undefined) {
     delete process.env.CET6_CONTENT_ROOT;
-  } else {
-    process.env.CET6_CONTENT_ROOT = ORIGINAL_CONTENT_ROOT;
+    return;
   }
-});
+  process.env.CET6_CONTENT_ROOT = ORIGINAL_CONTENT_ROOT;
+}
+
+/**
+ * Attach a secondary failure to the primary one without losing either.
+ *
+ * The primary is re-thrown by the caller, so it stays the visible verdict; the
+ * secondary rides along on `cleanupError` and is also printed, because a cleanup
+ * problem that only exists inside an object nobody inspects has not been reported.
+ */
+function attachSecondaryError(primary: unknown, secondary: unknown): void {
+  if (primary !== null && typeof primary === "object") {
+    try {
+      (primary as { cleanupError?: unknown }).cleanupError = secondary;
+    } catch {
+      /* a frozen error object must not lose the secondary entirely */
+    }
+  }
+  const text = secondary instanceof Error ? secondary.message : String(secondary);
+  console.error(`FAIL  (secondary) ${text}`);
+}
 
 /**
  * Remove `dir` and fail loudly if it survives.
  *
- * Uses the shared `createTempDir` registry indirectly: `assertRemoved` removes and
- * then **verifies absence**, because `rmSync` can return without throwing while
- * the path remains (a busy handle on Windows). "Did not throw" is not "is gone".
+ * "Did not throw" is not "is gone": `rmSync` can return while the path remains (a
+ * busy handle on Windows, a partially removed tree). The verdict is the existence
+ * check, not the absence of an exception.
+ *
+ * ── Why the underlying error text is NOT included ──
+ *
+ * A Node filesystem error's message embeds the absolute path it failed on
+ * (`EPERM: operation not permitted, rmdir '<drive>:\Users\<account>\AppData\...'`).
+ * Concatenating it into our own error put the local account path into a test
+ * failure that CI publishes. Only a whitelisted error code is carried through —
+ * the same rule `tools/temp-workspace.mjs` applies — because the code identifies
+ * the *kind* of failure without disclosing the location.
  */
 function assertRemoved(dir: string): void {
-  let failure: unknown;
+  let failureCode = "CLEANUP_FAILED";
   try {
     rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 40 });
   } catch (error) {
-    failure = error;
+    failureCode = safeErrorCode(error);
   }
   if (existsSync(dir)) {
-    const detail = failure instanceof Error ? `${failure.name}: ${failure.message}` : "path still present";
-    throw new Error(
-      `temporary workspace could not be removed (${redactForLog(dir)}) — ${detail}. ` +
-        "A leftover directory is a failure, not a warning: it is the defect this cleanup exists to prevent.",
-    );
+    /* The code is passed directly: no cause object is retained, by design. */
+    throw new TempCleanupError(redactForLog(dir), undefined, failureCode);
   }
+}
+
+/**
+ * Reduce a filesystem error to a short, safe code.
+ *
+ * Mirrors the allow-list in `tools/temp-workspace.mjs`: a known code passes
+ * through, anything else becomes `CLEANUP_FAILED`. The list is duplicated rather
+ * than imported because this file's assertions run under the test runner and the
+ * helper's internal table is not part of its public surface.
+ */
+function safeErrorCode(error: unknown): string {
+  const ALLOWED = new Set([
+    "EACCES", "EBUSY", "EEXIST", "EISDIR", "EMFILE", "ENOENT",
+    "ENOTDIR", "ENOTEMPTY", "EPERM", "EROFS",
+  ]);
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" && ALLOWED.has(code) ? code : "CLEANUP_FAILED";
 }
 
 /** Redact the account-bearing prefix; only the generated leaf name is shown. */
