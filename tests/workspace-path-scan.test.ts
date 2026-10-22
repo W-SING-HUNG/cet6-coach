@@ -2,10 +2,17 @@ import { describe, expect, it } from "vitest";
 import {
   ALLOWED_SHAPES,
   ALLOWED_UNC_HOSTS,
+  __testing,
   classifyWindowsPath,
   describeFinding,
   findInternalWorkspacePaths,
 } from "../tools/workspace-path-scan.mjs";
+
+/*
+ * `__testing` 暴露的判据内部口径。允许表断言必须与检测器**用同一套词表**，
+ * 否则两者会对同一个词给出不同答案（N-PR3-2 的教训之一）。
+ */
+const { PLACEHOLDER_SEGMENTS, OS_SEGMENTS } = __testing;
 
 /**
  * `tools/workspace-path-scan.mjs` 的**单元级**回归。
@@ -148,31 +155,113 @@ describe("内部工作区路径判据 · 报告与允许表", () => {
     }
   });
 
-  it("允许表不得包含任何形如真实工作区的条目", () => {
+  it("允许表不得成为后门：条目必须逐条可解释且不得复合具名", () => {
     /*
      * 反向保护：允许表是唯一能静默放行一条路径的机制，因此它自身也必须
-     * 受约束 —— 一条形如 `<drive>:\<像真实目录名>\…` 的条目等于开后门。
+     * 受约束。
      *
-     * ── 为什么"禁止名单"必须在运行时推导 ──
+     * ── 旧实现为什么必须换掉（N-PR3-2）──
      *
-     * 本文件自己也在被扫描的树里。若这里把真实的工作区目录名**写死**成
-     * 字面量，这条断言本身就泄露了它想保护的东西 —— 与 N-V8-1 同类。
-     * 因此名单来自"当前进程实际位于哪个目录"，而不是一份手抄清单：
-     * 判据检查的是"允许表不得收录任何真实目录名"，而"真实"由运行环境定义。
+     * 上一版把 `process.cwd()` 的各级父目录名当作"真实目录名"，再断言允许表
+     * 首段不在其中。这让**用例结果取决于检出位置**：允许表里有以 `temp`
+     * 为首段的条目，只要仓库被检出在任何名为 `temp` 的层级下（临时目录、
+     * CI 的临时工作区），用例立刻变红；换个目录名又变绿。实测：同一棵树在
+     * 工作区下通过，检出到临时目录层级下即报"允许表收录了真实目录名"。
+     *
+     * 而且这个方向是反的：它指控的是"允许表里有个词恰好等于我脚下某个目录
+     * 名"，而真正的后门是"允许表里有一个真实安装名"。后者与 cwd 无关。
+     *
+     * ── 现在的判据（与 cwd 无关）──
+     *
+     * 一条都不得是**复合具名**形态（`acme-staging`、`owner_checkout`）。允许
+     * 表收录的是夹具词汇 —— 单个普通词（`root`、`study`、`temp`、`some`）、
+     * 或明确的合成名（`sample-root`、`synthetic-user`）。真实安装目录几乎总是
+     * 多段复合名，而复合名一旦进表就等于把某个具体安装加进了白名单。
+     *
+     * 注意这里**不**复述检测器的词表：允许表的作用恰恰是覆盖检测器对个别
+     * 夹具词的判断（`root`、`study` 确实"像一个安装名"），所以用检测器去
+     * 判定允许表会自相矛盾。判据只约束"允许表能长什么样"。
      */
-    const here = process.cwd().replace(/\\/g, "/").split("/").filter(Boolean);
-    // 当前工作目录的各级父目录名，就是这台机器上真实存在的目录名。
-    const realDirectoryNames = new Set(
-      here.map((segment) => segment.toLowerCase()).filter((segment) => segment.length >= 2),
-    );
+    const SYNTHETIC_ALLOWED = /^(?:sample|synthetic|fixture|example|dummy|fake)[-_]/i;
 
     for (const [shape] of ALLOWED_SHAPES) {
-      const first = shape.replace(/^[a-z]:[\\/]/, "").replace(/\\…$/, "").toLowerCase();
+      const first = shape.replace(/^[a-z]:[\\/]/, "").replace(/[\\/]…$/, "");
+      const lowered = first.toLowerCase();
+
+      const singleWord = !/[-_.]/.test(first);
+      const syntheticName = SYNTHETIC_ALLOWED.test(first);
+      const placeholder = PLACEHOLDER_SEGMENTS.has(lowered);
+      const osFurniture = OS_SEGMENTS.has(lowered);
+
       expect(
-        realDirectoryNames.has(first),
-        `允许表收录了真实目录名（${shape}）—— 允许表只能收录合成/占位词`,
-      ).toBe(false);
+        singleWord || syntheticName || placeholder || osFurniture,
+        `允许表收录了复合具名目录（${shape}）—— 这类形态只可能是真实安装名`,
+      ).toBe(true);
     }
+  });
+
+  /**
+   * ── N-PR3-2 的固定回归：判定与检出目录名无关 ──
+   *
+   * 把旧算法的判定函数显式写出来，在两组输入上跑：一组目录名碰巧等于允许表
+   * 词汇，一组是中性名。旧断言在两组之间结论**不同**（前者红、后者绿）——
+   * 这就是缺陷。新判据不读 cwd，所以两组结论必须一致。
+   */
+  it("允许表判定与检出目录名无关（N-PR3-2 回归）", () => {
+    /*
+     * 这些目录名的首段都出现在 `ALLOWED_SHAPES` 里，且在真实机器上都可能是
+     * 检出路径的某一级。运行时拼出，本文件不落完整字面量。
+     */
+    const collidingCheckouts = ["temp", "repo", "some", "synthetic-user", "sample-root"].map(
+      (segment) => win("C:", segment, "checkout"),
+    );
+    const neutralCheckouts = ["workspace", "dev", "ci-run-42"].map((segment) =>
+      win("C:", segment, "checkout"),
+    );
+
+    /** 旧算法：把 cwd 各级父目录名当作"真实目录名"，再与允许表首段比对。 */
+    const oldRuleFails = (cwd: string): boolean => {
+      const realNames = new Set(
+        cwd
+          .replace(/\\/g, "/")
+          .split("/")
+          .filter(Boolean)
+          .map((segment) => segment.toLowerCase())
+          .filter((segment) => segment.length >= 2),
+      );
+      return [...ALLOWED_SHAPES.keys()].some((shape) =>
+        realNames.has(shape.replace(/^[a-z]:[\\/]/, "").replace(/[\\/]…$/, "").toLowerCase()),
+      );
+    };
+
+    /*
+     * 前提：旧算法确实在"名字碰撞"组上变红、在中性组上不变红。若这条前提
+     * 不成立，本回归就证明不了任何事 —— 所以它本身也是断言。
+     */
+    expect(collidingCheckouts.filter(oldRuleFails).length, "旧算法应在碰撞组上失败").toBe(
+      collidingCheckouts.length,
+    );
+    expect(neutralCheckouts.filter(oldRuleFails).length, "旧算法在中性组上不应失败").toBe(0);
+
+    /*
+     * 新判据：完全不读 cwd。同一份允许表在任何检出位置下结论一致。
+     */
+    const SYNTHETIC_ALLOWED = /^(?:sample|synthetic|fixture|example|dummy|fake)[-_]/i;
+    const verdict = (): boolean =>
+      [...ALLOWED_SHAPES.keys()].every((shape) => {
+        const first = shape.replace(/^[a-z]:[\\/]/, "").replace(/[\\/]…$/, "");
+        const lowered = first.toLowerCase();
+        return (
+          !/[-_.]/.test(first) ||
+          SYNTHETIC_ALLOWED.test(first) ||
+          PLACEHOLDER_SEGMENTS.has(lowered) ||
+          OS_SEGMENTS.has(lowered)
+        );
+      });
+
+    const verdicts = [...collidingCheckouts, ...neutralCheckouts].map(() => verdict());
+    expect(new Set(verdicts).size, "判定结果必须与 cwd 无关（两组完全一致）").toBe(1);
+    expect(verdicts[0], "允许表必须通过该判定").toBe(true);
   });
 });
 

@@ -10,28 +10,28 @@
  *
  * Each control below plants a wrong state in a throwaway full-tree copy and
  * requires the real gate to REFUSE it. The baseline control proves the copy is
- * accepted when unmodified — without it, the rest would prove nothing.
+ * accepted when unmodified �?without it, the rest would prove nothing.
  *
  * ── What "wrong" means, and why each case is separate ──
  *
- *   - licence **deleted**             → a clone would receive no grant
- *   - licence **tampered** (body)     → an MIT heading over a different grant
- *   - licence **widened** (copyleft)  → contradictory terms appended
- *   - **holder** blank                → rights that cannot be attributed
- *   - **SPDX conflict**               → package.json disagrees with LICENSE
- *   - **README stale**                → still says "not yet decided"
- *   - **CONTRIBUTING stale**          → contributor told the opposite
- *   - **inbound = outbound missing**  → contributor cannot know what they grant
- *   - **third-party carve-out gone**  → MIT appears to cover dependencies
- *   - **study-content carve-out gone**→ MIT appears to cover exam papers
+ *   - licence **deleted**             �?a clone would receive no grant
+ *   - licence **tampered** (body)     �?an MIT heading over a different grant
+ *   - licence **widened** (copyleft)  �?contradictory terms appended
+ *   - **holder** blank                �?rights that cannot be attributed
+ *   - **SPDX conflict**               �?package.json disagrees with LICENSE
+ *   - **README stale**                �?still says "not yet decided"
+ *   - **CONTRIBUTING stale**          �?contributor told the opposite
+ *   - **inbound = outbound missing**  �?contributor cannot know what they grant
+ *   - **third-party carve-out gone**  �?MIT appears to cover dependencies
+ *   - **study-content carve-out gone**�?MIT appears to cover exam papers
  *
  * Usage: node tools/license-check-controls.mjs
  */
 
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { cpSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
+import { createTempDir } from "./temp-workspace.mjs";
 
 const ROOT = process.cwd();
 const GATE = join(ROOT, "tools", "public-release-check.mjs");
@@ -42,7 +42,7 @@ function check(label, condition, detail = "") {
     console.log(`ok    ${label}`);
   } else {
     failures += 1;
-    console.error(`FAIL  ${label}${detail === "" ? "" : ` — ${detail}`}`);
+    console.error(`FAIL  ${label}${detail === "" ? "" : ` �?${detail}`}`);
   }
 }
 
@@ -54,7 +54,7 @@ function check(label, condition, detail = "") {
  * fail for reasons unrelated to the licence clause.
  */
 function makeTree(mutate) {
-  const dir = mkdtempSync(join(tmpdir(), "licence-ctl-"));
+  const dir = createTempDir("licence-ctl-").path;
   cpSync(ROOT, dir, {
     recursive: true,
     filter: (source) => {
@@ -64,7 +64,7 @@ function makeTree(mutate) {
   });
   mutate(dir);
 
-  const configRoot = mkdtempSync(join(tmpdir(), "licence-gitcfg-"));
+  const configRoot = createTempDir("licence-gitcfg-").path;
   const gitEnv = {
     ...process.env,
     GIT_CONFIG_GLOBAL: join(configRoot, "global"),
@@ -230,4 +230,4 @@ if (failures > 0) {
   console.error(`licence check controls: ${failures} FAILED`);
   process.exit(1);
 }
-console.log("licence check controls: PASS — the gate rejects every wrong licence state");
+console.log("licence check controls: PASS �?the gate rejects every wrong licence state");

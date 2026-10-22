@@ -8,7 +8,7 @@
  * ── Confinement ──
  *
  * The planted strings are generated at runtime from a base and a counter, so this
- * file never contains a literal that looks like a real workspace path — the same
+ * file never contains a literal that looks like a real workspace path �?the same
  * discipline `tools/smoke-test.mjs` uses for machine names. Failure output is
  * asserted *not* to contain the planted path, because a CI log is as public as
  * the repository: echoing the secret there would move the leak, not remove it.
@@ -16,10 +16,10 @@
  * Usage: node tools/workspace-path-controls.mjs
  */
 
-import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { cpSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
+import { createTempDir } from "./temp-workspace.mjs";
 
 const ROOT = process.cwd();
 const GATE = join(ROOT, "tools", "public-release-check.mjs");
@@ -30,7 +30,7 @@ function check(label, condition, detail = "") {
     console.log(`ok    ${label}`);
   } else {
     failures += 1;
-    console.error(`FAIL  ${label}${detail === "" ? "" : ` — ${detail}`}`);
+    console.error(`FAIL  ${label}${detail === "" ? "" : ` �?${detail}`}`);
   }
 }
 
@@ -45,7 +45,7 @@ const win = (...segments) => segments.join(BS);
  * fail for reasons unrelated to this clause.
  */
 function makeTree(mutate) {
-  const dir = mkdtempSync(join(tmpdir(), "wspath-ctl-"));
+  const dir = createTempDir("wspath-ctl-").path;
   cpSync(ROOT, dir, {
     recursive: true,
     filter: (source) => {
@@ -154,7 +154,7 @@ function syntheticInternalPath() {
 {
   /*
    * Assembled at runtime from parts, so this file contains no literal instance
-   * of the shape it plants. The gate scans this file too — correctly — and a
+   * of the shape it plants. The gate scans this file too �?correctly �?and a
    * control that stores a real-looking path would be caught by the very check it
    * is testing.
    */
@@ -234,7 +234,7 @@ function syntheticInternalPath() {
   /*
    * `C:\\Windows\\system32` contains a double backslash, but it is a drive path.
    * If the UNC rule fired here it would report a share on a host called
-   * "Windows" — noise, and noise is how a scanner gets switched off.
+   * "Windows" �?noise, and noise is how a scanner gets switched off.
    */
   const dir = makeTree((d) => {
     plant(d, "src/lib/probe2.ts", `const p = "C:${BS}${BS}Windows${BS}${BS}system32${BS}win.ini";`);
@@ -249,4 +249,4 @@ if (failures > 0) {
   console.error(`workspace-path controls: ${failures} FAILED`);
   process.exit(1);
 }
-console.log("workspace-path controls: PASS — the gate rejects injected paths and accepts legitimate content");
+console.log("workspace-path controls: PASS �?the gate rejects injected paths and accepts legitimate content");

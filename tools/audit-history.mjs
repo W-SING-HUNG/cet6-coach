@@ -31,6 +31,10 @@
 
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import {
+  describeStatusCodeFinding,
+  findInternalStatusCodes,
+} from "./internal-status-code-scan.mjs";
 
 const JSON_OUTPUT = process.argv.includes("--json");
 const EXPECT_FRESH = process.argv.includes("--expect-fresh");
@@ -245,6 +249,33 @@ function record(id, title, violations) {
     [/\bOwner\b/, "internal role word"],
   ];
 
+  /*
+   * ── Internal status codes (underscore-joined) ──
+   *
+   * Every rule above matches **space-separated attribution**. An internal
+   * acceptance code is a single underscore-joined identifier with no spaces, so it
+   * passed all of them. That is how one reached public `master`: the code had no
+   * space for `<ROLE> PASS` to match, and no `reviewed by` phrase. The literal
+   * token is deliberately **not** reproduced here — a scanner must not carry the
+   * material it refuses, and this file is itself scanned.
+   *
+   * See `tools/internal-status-code-scan.mjs` for the shape and for why a plain
+   * "any uppercase snake token" rule would be unusable here (the tree contains
+   * hundreds of legitimate constant and env-var names).
+   */
+  const statusCodeViolations = [];
+
+  /** Commit SHAs whose *already-published* status code the Owner has accepted. */
+  const ACCEPTED_LEGACY = new Map([
+    [
+      "c97db4b88cf63b30132516a6328189c749442c9a",
+      "merge commit already published before this rule existed; the Owner chose to " +
+        "keep the public history rather than rewrite it, so the token cannot be removed " +
+        "without a force-push. Recorded here so it is visible and so the rule stays " +
+        "enabled for every other commit.",
+    ],
+  ]);
+
   let messages = [];
   try {
     messages = git(["log", "--all", "--format=%H%x00%B%x00---"])
@@ -255,6 +286,8 @@ function record(id, title, violations) {
     messages = [];
   }
 
+  const seenLegacy = new Set();
+
   for (const block of messages) {
     const [sha, ...bodyParts] = block.split("\x00");
     const body = bodyParts.join("");
@@ -264,7 +297,47 @@ function record(id, title, violations) {
         break;
       }
     }
+
+    /*
+     * Status codes are matched separately, and the acceptance is keyed on the
+     * **exact commit SHA plus the exact token** — never on a pattern, a path or a
+     * date range. A broad exemption would be a hole: the next commit could reuse
+     * it. Here the exemption applies to one immutable object, and it is asserted
+     * below to still be needed.
+     */
+    for (const finding of findInternalStatusCodes(body)) {
+      const accepted = ACCEPTED_LEGACY.get(sha);
+      if (accepted !== undefined) {
+        seenLegacy.add(sha);
+        continue;
+      }
+      statusCodeViolations.push({
+        file: sha.slice(0, 12),
+        category: `commit message: ${describeStatusCodeFinding(finding)}`,
+      });
+    }
   }
+
+  /*
+   * The reverse direction, which is what stops the acceptance list from rotting
+   * into a blanket exemption: every accepted commit must still be present AND must
+   * still actually carry a status code. If the history is ever rewritten (or a
+   * rebase changes the SHA), the entry stops matching and this fires — so the
+   * acceptance cannot silently become a permanent no-op that hides a new leak.
+   */
+  for (const sha of ACCEPTED_LEGACY.keys()) {
+    if (!seenLegacy.has(sha)) {
+      violations.push({
+        file: sha.slice(0, 12),
+        category:
+          "accepted legacy status code is no longer present — remove the entry from ACCEPTED_LEGACY " +
+          "(a stale acceptance would let a future reintroduction through)",
+      });
+    }
+  }
+
+  violations.push(...statusCodeViolations);
+
   record("commit-messages", `no internal process vocabulary in ${messages.length} message(s)`, violations);
 }
 

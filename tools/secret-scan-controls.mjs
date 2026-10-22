@@ -13,7 +13,7 @@
  *
  * So this tool plants real-shaped credentials into a **temporary copy of the
  * tree** and re-runs the actual gate against it. Nothing is written to the real
- * tree, and the planted values are synthetic — assembled at runtime from
+ * tree, and the planted values are synthetic �?assembled at runtime from
  * fragments so that this file itself never contains a credential-shaped literal.
  *
  * It also proves the negative direction: an ordinary prose file must not be
@@ -31,9 +31,9 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { createTempDir } from "./temp-workspace.mjs";
 
 const KEEP = process.argv.includes("--keep");
 const ROOT = process.cwd();
@@ -46,7 +46,7 @@ function syntheticSecrets() {
    * The PEM header is assembled too, not written literally.
    *
    * Writing it literally made this very file the only thing the baseline scan
-   * reported — the scanner correctly flagged a private-key header inside the file
+   * reported �?the scanner correctly flagged a private-key header inside the file
    * that plants private-key headers. The tempting "fix" would be to exempt this
    * file from the scan, which is how a scanner ends up not scanning its own
    * directory. Building the string at runtime keeps the scanner honest and keeps
@@ -75,7 +75,7 @@ function check(label, condition, detail = "") {
     return;
   }
   failures += 1;
-  console.error(`FAIL  ${label}${detail === "" ? "" : ` — ${detail}`}`);
+  console.error(`FAIL  ${label}${detail === "" ? "" : ` �?${detail}`}`);
 }
 
 /**
@@ -87,7 +87,7 @@ function check(label, condition, detail = "") {
  * take minutes.
  */
 function cloneTree() {
-  const target = mkdtempSync(join(tmpdir(), "cet6-secret-control-"));
+  const target = createTempDir("cet6-secret-control-").path;
   cpSync(ROOT, target, {
     recursive: true,
     filter: (source) => {

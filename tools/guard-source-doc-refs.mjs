@@ -14,7 +14,7 @@
  * ── Why no withheld name appears in this file ──
  *
  * An earlier draft wrote one out in this header. That made the probe a third copy
- * of a name that must not be published — and the doc-reference checker, correctly,
+ * of a name that must not be published �?and the doc-reference checker, correctly,
  * then flagged the probe itself. The name is now *read* from the gate's forbidden
  * table at runtime, so the single source of truth stays single.
  *
@@ -26,10 +26,10 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createTempDir } from "./temp-workspace.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..");
@@ -39,7 +39,7 @@ function check(label, condition, detail = "") {
   if (condition) console.log(`ok    ${label}`);
   else {
     failures += 1;
-    console.error(`FAIL  ${label}${detail ? ` — ${detail}` : ""}`);
+    console.error(`FAIL  ${label}${detail ? ` �?${detail}` : ""}`);
   }
 }
 
@@ -51,7 +51,7 @@ function check(label, condition, detail = "") {
  *
  * The gate writes this entry as an alternation:
  *
- *     /^docs\/(name-a|name-b|…)\.md$/
+ *     /^docs\/(name-a|name-b|�?\.md$/
  *
  * so the extraction pulls the first alternative and unescapes the `\.` that the
  * regex needs but a filename does not.
@@ -79,7 +79,7 @@ if (WITHHELD === null) {
  * Fixture paths are assembled at runtime, not written literally.
  *
  * If this file contained the fixture paths as literals, the doc-reference checker
- * would scan *this* file and correctly report citations — the probe would be
+ * would scan *this* file and correctly report citations �?the probe would be
  * accusing itself. The assembly below keeps the probe free of real citations
  * while still producing them inside the temporary tree it builds.
  *
@@ -96,7 +96,7 @@ const EXAMPLE_DOC = fixtureDoc(`${"exam"}${"ple"}.md`);
 
 /** Build a synthetic repo the checker can run inside. */
 function makeTree(sourceComment) {
-  const scratch = mkdtempSync(join(tmpdir(), "n3-"));
+  const scratch = createTempDir("n3-").path;
   execFileSync("git", ["init", "-q"], { cwd: scratch, stdio: "ignore" });
 
   mkdirSync(join(scratch, "tools"), { recursive: true });

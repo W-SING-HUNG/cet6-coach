@@ -126,6 +126,28 @@ export function findTokensOutsideComments(source, patterns, options = {}) {
   return hits;
 }
 
+/**
+ * Which of the given offsets sit inside a region of one of the requested kinds.
+ *
+ * Exported so a second scanner can reuse **this** classifier instead of writing a
+ * regex-based stripper of its own. The template of the original defect in this
+ * repository is "two lists, maintained separately, that diverge silently" — a
+ * second, slightly different notion of "inside a comment" would be exactly that.
+ *
+ * @param {string} source
+ * @param {number[]} indexes offsets to test
+ * @param {{ language?: "js" | "markdown", kinds?: readonly string[] }} [options]
+ * @returns {boolean[]} one answer per offset, in the same order
+ */
+export function isInsideRegion(source, indexes, options = {}) {
+  const regions = classifyRegions(source, options.language ?? "js");
+  const wanted = new Set(options.kinds ?? ["comment"]);
+  const selected = regions.filter((region) => wanted.has(region.kind));
+  return indexes.map((index) =>
+    selected.some((region) => index >= region.start && index < region.end),
+  );
+}
+
 /** Replace matched regions with spaces, preserving offsets. */
 function blankRegions(source, regions, shouldBlank) {
   const characters = [...source];
@@ -142,8 +164,7 @@ function blankRegions(source, regions, shouldBlank) {
 /** The region containing `index`, or null if outside all recorded regions. */
 function regionAt(regions, index) {
   for (const region of regions) {
-    if (index >= region.start && index < region.end) return region;
-  }
+    if (index >= region.start && index < region.end) return region;  }
   return null;
 }
 

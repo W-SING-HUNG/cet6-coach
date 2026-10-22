@@ -37,8 +37,12 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, openSync, closeSync, readSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
-import { findTokensOutsideComments } from "./structural-scan.mjs";
+import { findTokensOutsideComments, isInsideRegion } from "./structural-scan.mjs";
 import { describeFinding, findInternalWorkspacePaths } from "./workspace-path-scan.mjs";
+import {
+  describeStatusCodeFinding,
+  findInternalStatusCodes,
+} from "./internal-status-code-scan.mjs";
 
 // ---------------------------------------------------------------- invocation
 
@@ -899,6 +903,85 @@ const TOKEN_ALLOWANCES = new Map([
     }
   }
   record("internal-process", "no internal workflow tokens", violations);
+}
+
+// ------------------------------------ 8b. internal status codes (underscore-joined)
+
+/**
+ * ── The gap this closes ──
+ *
+ * Every pattern in `INTERNAL_PROCESS_PATTERNS` matches **space-separated
+ * attribution**: `<role> review round <n>`, `reviewed by <Name>`, `<ROLE> PASS`.
+ * An internal acceptance code is a *single underscore-joined identifier* with no
+ * spaces, so the entire family was invisible to the table — which is how one
+ * reached public `master` inside a merge commit message.
+ *
+ * ── Why it is a separate record, not more patterns in the table ──
+ *
+ * The table's runner reports `where` (comment / string / regexp / code) and the
+ * allowance mechanism is a *count* per file. The status-code detector has a
+ * different false-positive story — it needs a word list of verdicts and an
+ * allowance table of constant names — so folding it in would make
+ * `count-allowance-tokens.mjs` report two unrelated quantities under one ceiling.
+ *
+ * ── Scope: reader-visible prose and string literals ──
+ *
+ * A status code leaks when a *reader* can see it. Two places qualify:
+ *
+ *   1. markdown, where there is no comment syntax and every character renders;
+ *   2. a string literal in code, which is printed or serialised somewhere.
+ *
+ * A code inside a **comment in code** is deliberately not counted: comments are
+ * how these scanners document the shapes they refuse, and the existing table
+ * treats them the same way for the same reason. Code *identifiers* are covered by
+ * the constant-name allowance list inside the detector.
+ */
+{
+  const violations = [];
+
+  for (const file of TEXT_FILES) {
+    const text = readText(file);
+    if (text === "") continue;
+    const language = file.endsWith(".md") ? "markdown" : "js";
+
+    const findings = findInternalStatusCodes(text);
+    if (findings.length === 0) continue;
+
+    /*
+     * Ask the structural reader which offsets sit inside a comment or a RegExp
+     * literal, instead of writing a second stripper here. One definition, shared
+     * with the token table — two would diverge silently, which is the defect
+     * pattern this repository already documents.
+     *
+     * Both tolerances mirror the token table exactly:
+     *
+     *   - a **code comment** is where these scanners document the shapes they
+     *     refuse;
+     *   - a **RegExp literal** is a pattern definition, which must contain the
+     *     shape it matches.
+     *
+     * A string literal is deliberately NOT tolerated: that is what prints or
+     * serialises, so a status code there is published. In markdown there is no
+     * comment or regexp syntax, so nothing is tolerated and every character is
+     * reader-visible prose.
+     */
+    const tolerated = isInsideRegion(
+      text,
+      findings.map((finding) => finding.index),
+      { language, kinds: ["comment", "regexp"] },
+    );
+
+    findings.forEach((finding, position) => {
+      if (tolerated[position]) return;
+      violations.push({ file, category: describeStatusCodeFinding(finding) });
+    });
+  }
+
+  record(
+    "internal-status-codes",
+    "no underscore-joined internal status code in published prose or strings",
+    violations,
+  );
 }
 
 // ------------------------------------------------------------- 9. attribution

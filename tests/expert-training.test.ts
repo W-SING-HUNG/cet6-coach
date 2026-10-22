@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, afterAll } from "vitest";
+import { describe, expect, it, beforeEach, afterAll, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -37,6 +37,32 @@ let repoDir: string;
 let db: DatabaseSync;
 let repos: Repositories;
 let contentRoot: string;
+
+/**
+ * ── 为什么每个用例结束就删，而不是只在文件末尾删一次 ──
+ *
+ * `beforeEach` 每个用例都建一个新的临时目录，但清理原先只挂在 `process.on("exit")`
+ * 上，且只删**最后一个** `repoDir` —— 前面每个用例的目录都留着。实测：跑一遍
+ * 完整测试套件，临时目录里积累了几十个 `cet6-expert-*`。
+ *
+ * 这里改成 `afterEach` 逐用例删除，`process.on("exit")` 保留作为异常退出
+ * （进程被杀、用例抛错导致 afterEach 未执行）的兜底，两者不重复也不冲突：
+ * `rmSync(..., { force: true })` 对已删除的路径是空操作。
+ */
+afterEach(() => {
+  if (!repoDir) return;
+  try {
+    rmSync(repoDir, { recursive: true, force: true });
+  } catch (error) {
+    /*
+     * 清理失败必须出声，不能吞掉：未被报告的残留就是这条缺陷本身。
+     * 但仍然不抛错 —— 抛错会把真正的用例失败替换成清理失败。
+     */
+    console.error(`FAIL  temporary workspace could not be removed: ${repoDir} — ${String(error)}`);
+  }
+  repoDir = "";
+  delete process.env.CET6_CONTENT_ROOT;
+});
 
 beforeEach(() => {
   repoDir = mkdtempSync(join(tmpdir(), "cet6-expert-"));
