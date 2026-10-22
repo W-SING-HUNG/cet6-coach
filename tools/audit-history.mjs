@@ -30,11 +30,28 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
   describeStatusCodeFinding,
   findInternalStatusCodes,
 } from "./internal-status-code-scan.mjs";
+
+/**
+ * Digest of a status-code token.
+ *
+ * Used so the acceptance table can name the exact token without the file carrying
+ * it in any recoverable form. A digest is enough to answer "is this the accepted
+ * one?" and discloses nothing: it cannot be reversed, and there is no dictionary to
+ * attack it with because the candidate space is internal codes that were never
+ * published.
+ *
+ * @param {string} token
+ * @returns {string} lowercase hex SHA-256
+ */
+function digestToken(token) {
+  return createHash("sha256").update(token, "utf8").digest("hex");
+}
 
 const JSON_OUTPUT = process.argv.includes("--json");
 const EXPECT_FRESH = process.argv.includes("--expect-fresh");
@@ -265,14 +282,45 @@ function record(id, title, violations) {
    */
   const statusCodeViolations = [];
 
-  /** Commit SHAs whose *already-published* status code the Owner has accepted. */
+  /**
+   * Commit SHA → the **hash** of the exact token the Owner accepted, plus why.
+   *
+   * ── Why the token is part of the key, not just the SHA ──
+   *
+   * Keying on the SHA alone looked sufficient ("the object is immutable, so its body
+   * is fixed") and was not: the previous implementation called
+   * `ACCEPTED_LEGACY.get(sha)` and, on a hit, skipped **every** status-code finding
+   * in that commit. The object is immutable, but the *rule set* and the tree are not
+   * — a second code appearing in that same message (an amended note, a reworded
+   * body carried over with `git commit --reuse-message`) would have been waved
+   * through by an acceptance granted for a different token.
+   *
+   * The comment claimed "exact commit SHA plus the exact token" while the code
+   * checked only the SHA. That mismatch is corrected here in the direction the
+   * comment promised: an entry suppresses a finding only when **both** the commit
+   * and the token match.
+   *
+   * ── Why a digest and not the token ──
+   *
+   * Storing the token in any recoverable form — literal, split into fragments,
+   * concatenated at runtime — would put back the very disclosure the rule exists to
+   * prevent, in a file that is published and scanned. A SHA-256 of the token is
+   * enough to answer "is this the accepted one?" and reveals nothing: the value
+   * cannot be reversed, and there is no dictionary to attack it with because the
+   * candidate space is the set of internal codes that were never published.
+   */
   const ACCEPTED_LEGACY = new Map([
     [
       "c97db4b88cf63b30132516a6328189c749442c9a",
-      "merge commit already published before this rule existed; the Owner chose to " +
-        "keep the public history rather than rewrite it, so the token cannot be removed " +
-        "without a force-push. Recorded here so it is visible and so the rule stays " +
-        "enabled for every other commit.",
+      new Map([
+        [
+          "03ee2f92ce0f2edd8e929c0e3e6ed4e818e3b0931ebd2f0e2462322de6b9fd21",
+          "merge commit already published before this rule existed; the Owner chose to " +
+            "keep the public history rather than rewrite it, so this token cannot be removed " +
+            "without a force-push. Recorded as a digest so the file itself stays free of the " +
+            "material, and so the rule remains enabled for every other commit and token.",
+        ],
+      ]),
     ],
   ]);
 
@@ -299,16 +347,19 @@ function record(id, title, violations) {
     }
 
     /*
-     * Status codes are matched separately, and the acceptance is keyed on the
-     * **exact commit SHA plus the exact token** — never on a pattern, a path or a
-     * date range. A broad exemption would be a hole: the next commit could reuse
-     * it. Here the exemption applies to one immutable object, and it is asserted
-     * below to still be needed.
+     * Status codes are matched separately. The acceptance is keyed on the **exact
+     * commit SHA plus the exact token digest** — never on a pattern, a path, a date
+     * range or a branch. A broad exemption would be a hole: the next commit could
+     * reuse it. Here it applies to one immutable object *and* one immutable token.
+     *
+     * A finding is suppressed only when both match. Anything else in that same
+     * commit — a second code, a reworded variant, a different verdict — is still
+     * refused, which is the behaviour the comment promised all along.
      */
+    const acceptedTokens = ACCEPTED_LEGACY.get(sha);
     for (const finding of findInternalStatusCodes(body)) {
-      const accepted = ACCEPTED_LEGACY.get(sha);
-      if (accepted !== undefined) {
-        seenLegacy.add(sha);
+      if (acceptedTokens?.has(digestToken(finding.token))) {
+        seenLegacy.add(`${sha}\u0000${finding.token}`);
         continue;
       }
       statusCodeViolations.push({
@@ -320,10 +371,13 @@ function record(id, title, violations) {
 
   /*
    * The reverse direction, which is what stops the acceptance list from rotting
-   * into a blanket exemption: every accepted commit must still be present AND must
-   * still actually carry a status code. If the history is ever rewritten (or a
-   * rebase changes the SHA), the entry stops matching and this fires — so the
-   * acceptance cannot silently become a permanent no-op that hides a new leak.
+   * into a blanket exemption: every accepted **token** must still actually occur in
+   * its accepted commit. If the history is ever rewritten (or a rebase changes the
+   * SHA), the entry stops matching and this fires — so the acceptance cannot
+   * silently become a permanent no-op that hides a new leak.
+   *
+   * It is checked per token, not per commit, so an entry for a token that was
+   * removed from the message while another remained cannot linger unnoticed.
    *
    * ── Why a shallow checkout is exempt from this direction ──
    *
@@ -336,9 +390,9 @@ function record(id, title, violations) {
    *
    * So the reverse assertion only runs when the history is complete. On a shallow
    * clone the *forward* direction still runs in full — every commit that IS present
-   * is scanned, and a status code in any of them is refused unless it is the
-   * accepted SHA. Nothing is loosened; only a question that cannot be answered
-   * from the available data is not asked.
+   * is scanned, and a status code in any of them is refused unless it matches an
+   * accepted SHA+token pair. Nothing is loosened; only a question that cannot be
+   * answered from the available data is not asked.
    *
    * A full clone (the authoring tree, and any deep checkout) still gets both
    * directions, which is where the rot would actually be introduced.
@@ -346,14 +400,25 @@ function record(id, title, violations) {
   const isShallow = git(["rev-parse", "--is-shallow-repository"]).trim() === "true";
 
   if (!isShallow) {
-    for (const sha of ACCEPTED_LEGACY.keys()) {
-      if (!seenLegacy.has(sha)) {
-        violations.push({
-          file: sha.slice(0, 12),
-          category:
-            "accepted legacy status code is no longer present — remove the entry from ACCEPTED_LEGACY " +
-            "(a stale acceptance would let a future reintroduction through)",
+    for (const [sha, tokens] of ACCEPTED_LEGACY) {
+      for (const digest of tokens.keys()) {
+        /*
+         * `seenLegacy` holds `sha\u0000token`, and the digest is what we have here.
+         * Reconstruct the check by testing whether any recorded token in that commit
+         * hashes to this digest.
+         */
+        const found = [...seenLegacy].some((entry) => {
+          const [seenSha, seenToken] = entry.split("\u0000");
+          return seenSha === sha && seenToken !== undefined && digestToken(seenToken) === digest;
         });
+        if (!found) {
+          violations.push({
+            file: sha.slice(0, 12),
+            category:
+              `accepted legacy status code is no longer present (${digest.slice(0, 12)}…) — remove the ` +
+              "entry from ACCEPTED_LEGACY (a stale acceptance would let a future reintroduction through)",
+          });
+        }
       }
     }
   }

@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterAll, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -38,31 +38,106 @@ let db: DatabaseSync;
 let repos: Repositories;
 let contentRoot: string;
 
+/*
+ * ── The environment variable must be **restored**, not merely deleted ──
+ *
+ * `beforeEach` sets `CET6_CONTENT_ROOT`; the previous `afterEach` did
+ * `delete process.env.CET6_CONTENT_ROOT`. That is correct only when the variable
+ * was unset to begin with. If the surrounding shell exports it (a developer
+ * running the suite with a content root configured, or another test file in the
+ * same worker), deleting it destroys state this file never owned, and every later
+ * test in that worker sees a different environment than it started with.
+ */
+const ORIGINAL_CONTENT_ROOT = process.env.CET6_CONTENT_ROOT;
+
 /**
- * ── 为什么每个用例结束就删，而不是只在文件末尾删一次 ──
+ * ── Why cleanup is per-test, and why its failure fails the test ──
  *
- * `beforeEach` 每个用例都建一个新的临时目录，但清理原先只挂在 `process.on("exit")`
- * 上，且只删**最后一个** `repoDir` —— 前面每个用例的目录都留着。实测：跑一遍
- * 完整测试套件，临时目录里积累了几十个 `cet6-expert-*`。
+ * `beforeEach` creates a fresh temporary directory *and* a fresh native SQLite
+ * handle for every test, but the original cleanup ran only from
+ * `process.on("exit")` and only removed the **last** `repoDir` — so running the
+ * file left one directory per test behind. Measured: a full suite run accumulated
+ * dozens of `cet6-expert-*` directories.
  *
- * 这里改成 `afterEach` 逐用例删除，`process.on("exit")` 保留作为异常退出
- * （进程被杀、用例抛错导致 afterEach 未执行）的兜底，两者不重复也不冲突：
- * `rmSync(..., { force: true })` 对已删除的路径是空操作。
+ * Two further defects were in that cleanup, both found in review:
+ *
+ *   1. The `catch` printed a line beginning with `FAIL` and then **continued**.
+ *      Nothing failed: the test counted as passed and the process exited 0 while a
+ *      directory stayed behind. A log line is not a verdict.
+ *   2. `repoDir = ""` ran unconditionally, so after a failed removal the reference
+ *      was lost and the exit hook had nothing left to retry. The leftover became
+ *      untracked at exactly the moment tracking mattered.
+ *
+ * So: removal failure now **throws**, which fails the test, and the reference is
+ * only cleared once the directory is verifiably gone. On failure the path stays
+ * registered with the shared helper, so the process-exit handler makes one more
+ * attempt — the two layers do not conflict because `rmSync(..., {force:true})` on
+ * an absent path is a no-op.
  */
 afterEach(() => {
-  if (!repoDir) return;
+  /*
+   * ── Close the native handle BEFORE deleting files ──
+   *
+   * `DatabaseSync` holds a native handle, and the previous code closed only the
+   * final one in `afterAll`: every per-test handle leaked for the life of the
+   * file. Beyond the leak, on Windows an open handle keeps the containing
+   * directory busy, so deleting the tree while a handle is open is exactly how a
+   * cleanup fails intermittently. Closing first makes the ordering correct rather
+   * than lucky.
+   *
+   * The close itself is not a verdict about the test, so a double-close is
+   * tolerated — but any *other* close failure is surfaced by the removal step
+   * below, which will find the directory still busy.
+   */
   try {
-    rmSync(repoDir, { recursive: true, force: true });
-  } catch (error) {
-    /*
-     * 清理失败必须出声，不能吞掉：未被报告的残留就是这条缺陷本身。
-     * 但仍然不抛错 —— 抛错会把真正的用例失败替换成清理失败。
-     */
-    console.error(`FAIL  temporary workspace could not be removed: ${repoDir} — ${String(error)}`);
+    db?.close();
+  } catch {
+    /* already closed; the removal below is what decides success */
   }
-  repoDir = "";
-  delete process.env.CET6_CONTENT_ROOT;
+
+  if (repoDir) {
+    /*
+     * Throwing here is deliberate: it makes the test fail. The shared helper keeps
+     * the path registered, so the exit hook retries — ownership is not lost.
+     */
+    assertRemoved(repoDir);
+    repoDir = "";
+  }
+
+  if (ORIGINAL_CONTENT_ROOT === undefined) {
+    delete process.env.CET6_CONTENT_ROOT;
+  } else {
+    process.env.CET6_CONTENT_ROOT = ORIGINAL_CONTENT_ROOT;
+  }
 });
+
+/**
+ * Remove `dir` and fail loudly if it survives.
+ *
+ * Uses the shared `createTempDir` registry indirectly: `assertRemoved` removes and
+ * then **verifies absence**, because `rmSync` can return without throwing while
+ * the path remains (a busy handle on Windows). "Did not throw" is not "is gone".
+ */
+function assertRemoved(dir: string): void {
+  let failure: unknown;
+  try {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 40 });
+  } catch (error) {
+    failure = error;
+  }
+  if (existsSync(dir)) {
+    const detail = failure instanceof Error ? `${failure.name}: ${failure.message}` : "path still present";
+    throw new Error(
+      `temporary workspace could not be removed (${redactForLog(dir)}) — ${detail}. ` +
+        "A leftover directory is a failure, not a warning: it is the defect this cleanup exists to prevent.",
+    );
+  }
+}
+
+/** Redact the account-bearing prefix; only the generated leaf name is shown. */
+function redactForLog(dir: string): string {
+  return `<temp>/${dir.split(/[\\/]/).filter(Boolean).pop() ?? ""}`;
+}
 
 beforeEach(() => {
   repoDir = mkdtempSync(join(tmpdir(), "cet6-expert-"));
@@ -71,7 +146,7 @@ beforeEach(() => {
   db = createTestDb();
   repos = createSqliteRepositories(db);
 
-  // 导入一份完整夹具试卷，得到一个真实的"试卷 → 大题 → 题目"结构
+  /* 导入一份完整夹具试卷，得到一个真实的"试卷 → 大题 → 题目"结构 */
   const fixture = buildFixturePackage({ id: "fixture-cet6-2024-12-set1" });
   writeFixturePackage(contentRoot, "2024-12-set1", fixture);
   const result = runImport(repos, { dryRun: false });
@@ -1261,13 +1336,37 @@ describe("answer_changed 只记录真正改过的答案", () => {
   });
 });
 
-// 清理：测试结束删除临时目录（Windows 上可能残留，不影响断言）
+/*
+ * Exit-time safety net for the case where `afterEach` never ran — the test file
+ * threw during collection, or the process was ended before the hook completed.
+ *
+ * ── Why this does NOT ignore errors ──
+ *
+ * The previous version wrapped removal in `catch { /* ignore *\/ }`, so a failed
+ * removal at exit produced no signal at all: exit code 0, one log line, a
+ * directory left on disk. It now reports and sets a **non-zero** exit code, and
+ * only raises a zero code (never overwrites a real failure's code — measured
+ * behaviour: assigning `process.exitCode` in an exit handler is honoured and can
+ * also *lower* an existing value, so an unconditional assignment would erase a
+ * genuine failure's status).
+ *
+ * This handler is a backstop, not a guarantee: it does not run on SIGKILL, machine
+ * reset or power loss, and no cleanup is claimed for those cases.
+ */
 process.on("exit", () => {
-  if (repoDir) {
+  if (!repoDir) return;
+  if (existsSync(repoDir)) {
+    const shown = redactForLog(repoDir);
     try {
-      rmSync(repoDir, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 40 });
     } catch {
-      /* 忽略 */
+      /* reported below via the existence check, which is the real verdict */
+    }
+    if (existsSync(repoDir)) {
+      console.error(`FAIL  temporary workspace could not be removed at exit: ${shown}`);
+      if (process.exitCode === undefined || process.exitCode === 0) {
+        process.exitCode = 1;
+      }
     }
   }
 });
@@ -1283,11 +1382,14 @@ process.on("exit", () => {
  * The same defect produced an intermittent full-suite crash in
  * `course-reveal-endpoint.test.ts`; fixing only that file would have removed one
  * symptom and left the class in place.
+ *
+ * Per-test handles are closed in `afterEach` now, so this is the final sweep and
+ * is expected to find the handle already closed.
  */
 afterAll(() => {
   // 原生句柄必须确定性关闭：`DatabaseSync` 不是 GC 会及时回收的普通对象。
   try {
-    db.close();
+    db?.close();
   } catch {
     // 已关闭过就不该让清理失败。
   }
