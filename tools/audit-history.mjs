@@ -79,6 +79,174 @@ function record(id, title, violations) {
   results.push({ id, title, ok: violations.length === 0, violations });
 }
 
+// ── 0. History completeness (must run before anything is scanned) ──
+/**
+ * ── The coverage gap this closes ──
+ *
+ * `actions/checkout@v4` fetches **one commit** by default (`fetch-depth: 1`). On a
+ * shallow clone `git log --all` sees only that commit, so every message, identity
+ * and path check below scanned a single commit and reported a clean result — while
+ * the reachable history held fifteen more.
+ *
+ * The object-database audit *does* unshallow, but it runs **after** this gate in
+ * `.github/workflows/verify.yml`, so the history gate had already printed PASS on a
+ * truncated graph. Measured on a depth-1 clone of a four-commit probe repo whose
+ * second ancestor carried a synthetic status code:
+ *
+ *   history audit first  → exit 0, "no internal process vocabulary in 1 message(s)"
+ *   object audit (unshallows)
+ *   history audit again  → exit 1, "in 4 message(s)", violation reported
+ *
+ * The first line is the defect: a green history verdict that examined 1 of 4
+ * commits.
+ *
+ * ── Why completeness is asserted here rather than assumed ──
+ *
+ * Two ways to fix it: fetch the whole history up front, or make the check fail when
+ * the history is incomplete. This does **both**, in that order, because either one
+ * alone leaves a hole:
+ *
+ *   - fetching alone: a runner without network, or a fetch that partially succeeds,
+ *     still leaves a truncated graph and the gate would scan what it has;
+ *   - failing alone: CI would go red on every run for a reason that is the
+ *     checkout's fault rather than the tree's, which is how a gate gets disabled.
+ *
+ * So: attempt to complete the history, then **verify** it is complete, and fail
+ * closed if it is not. The verdict is now backed by the whole reachable history
+ * rather than by whatever happened to be fetched.
+ *
+ * ── What "complete" is measured against ──
+ *
+ * - `git rev-parse --is-shallow-repository` must report `false`;
+ * - `.git/shallow` must be absent or empty;
+ * - the commit count reachable from HEAD must be > 0 and consistent with the
+ *   shallow flag (a shallow repo with 1 commit is never accepted).
+ *
+ * On a `pull_request` event the checkout is GitHub's synthetic
+ * `refs/pull/N/merge` commit, which has two parents by construction. That is a
+ * merge of the PR head into the base, so its ancestry is exactly the union of both
+ * sides — unshallowing it yields the real history, and the existing shape check
+ * already understands that this commit legitimately has two parents. No special
+ * case is needed beyond not mistaking "two parents" for "forked history": that
+ * distinction is made by the root-commit count, not by the parent count.
+ */
+const COMPLETENESS = (() => {
+  const violations = [];
+  const notes = [];
+
+  const shallowFlag = () => {
+    try {
+      return git(["rev-parse", "--is-shallow-repository"]).trim() === "true";
+    } catch {
+      /* Not being able to answer is itself a completeness failure. */
+      return null;
+    }
+  };
+
+  const shallowBefore = shallowFlag();
+  let commitsBefore = 0;
+  try {
+    commitsBefore = Number.parseInt(git(["rev-list", "--count", "HEAD"]).trim(), 10) || 0;
+  } catch {
+    commitsBefore = 0;
+  }
+
+  if (shallowBefore === null) {
+    violations.push({
+      file: "(history)",
+      category:
+        "cannot determine whether the checkout is shallow — refusing to scan a history of unknown completeness",
+    });
+  } else if (shallowBefore) {
+    /*
+     * Complete the history. `--unshallow` fails on a repository that is already
+     * complete, so it is only attempted when the flag says it is needed.
+     *
+     * The fetch is tried against `origin` first and, failing that, against the
+     * configured default remote — a checkout may name its remote something else,
+     * and a silently failed fetch must not be mistaken for success.
+     */
+    let fetched = false;
+    const remotes = (() => {
+      try {
+        return git(["remote"]).trim().split("\n").filter(Boolean);
+      } catch {
+        return [];
+      }
+    })();
+    const preferred = remotes.includes("origin") ? "origin" : remotes[0];
+    if (preferred !== undefined) {
+      try {
+        git(["fetch", "--unshallow", "--quiet", preferred], { stdio: ["ignore", "pipe", "pipe"] });
+        fetched = true;
+      } catch {
+        fetched = false;
+      }
+    }
+    notes.push(
+      `history was shallow (${commitsBefore} commit(s) visible) — ` +
+        (fetched ? `unshallowed from ${preferred}` : "unshallow was not possible"),
+    );
+  }
+
+  /*
+   * Re-measure. These are the assertions that actually gate the verdict: the fetch
+   * above is best-effort, the state below is what the checks rely on.
+   */
+  const shallowAfter = shallowFlag();
+  if (shallowAfter !== false) {
+    violations.push({
+      file: "(history)",
+      category:
+        "the repository is still shallow — a commit-message audit over a truncated graph cannot " +
+        "claim the reachable history is clean (fetch the full history, e.g. actions/checkout with " +
+        "fetch-depth: 0, or allow the unshallow step to complete)",
+    });
+  }
+
+  const shallowFile = ".git/shallow";
+  if (existsSync(shallowFile)) {
+    let content = "";
+    try {
+      content = execFileSync("node", ["-e", "process.stdout.write(require('node:fs').readFileSync('.git/shallow','utf8'))"], {
+        encoding: "utf8",
+      }).trim();
+    } catch {
+      content = "";
+    }
+    if (content !== "") {
+      violations.push({
+        file: shallowFile,
+        category: `shallow boundary still recorded (${content.split("\n").filter(Boolean).length} commit(s))`,
+      });
+    }
+  }
+
+  let commitsAfter = 0;
+  try {
+    commitsAfter = Number.parseInt(git(["rev-list", "--count", "HEAD"]).trim(), 10) || 0;
+  } catch {
+    commitsAfter = 0;
+  }
+  if (commitsAfter === 0) {
+    violations.push({
+      file: "(history)",
+      category: "no commits reachable from HEAD — nothing was audited",
+    });
+  }
+
+  return { violations, notes, commitsBefore, commitsAfter, shallowBefore, shallowAfter };
+})();
+
+{
+  const violations = [...COMPLETENESS.violations];
+  record(
+    "history-completeness",
+    "the reachable history is complete before any check reads it",
+    violations,
+  );
+}
+
 // ── 1. History shape ──
 {
   const violations = [];
@@ -379,46 +547,37 @@ function record(id, title, violations) {
    * It is checked per token, not per commit, so an entry for a token that was
    * removed from the message while another remained cannot linger unnoticed.
    *
-   * ── Why a shallow checkout is exempt from this direction ──
+   * ── The former shallow exemption is gone ──
    *
-   * `actions/checkout` fetches **one commit by default**. On a shallow clone the
-   * accepted commit is not in the graph at all, so "not seen" means "not fetched",
-   * not "no longer present" — the two are indistinguishable from inside the tree,
-   * and conflating them made this check red on a correct tree. That is the exact
-   * failure mode the repository already documents elsewhere: a gate that is red
-   * for a reason unrelated to the code teaches people to ignore it.
+   * The previous revision skipped this direction when the checkout was shallow:
+   * `actions/checkout` fetches one commit by default, so the accepted commit was
+   * absent from the graph and "not seen" was indistinguishable from "no longer
+   * present". Skipping was the least-bad choice *at the time*, but it was also how
+   * the coverage gap stayed invisible — the whole gate quietly measured one commit.
    *
-   * So the reverse assertion only runs when the history is complete. On a shallow
-   * clone the *forward* direction still runs in full — every commit that IS present
-   * is scanned, and a status code in any of them is refused unless it matches an
-   * accepted SHA+token pair. Nothing is loosened; only a question that cannot be
-   * answered from the available data is not asked.
-   *
-   * A full clone (the authoring tree, and any deep checkout) still gets both
-   * directions, which is where the rot would actually be introduced.
+   * Now that check 0 refuses to run the audit on a truncated graph, this direction
+   * always has a complete history to ask about, so it always runs. The exemption is
+   * removed rather than kept as a fallback: a branch that can quietly not check
+   * something is exactly what this round exists to eliminate.
    */
-  const isShallow = git(["rev-parse", "--is-shallow-repository"]).trim() === "true";
-
-  if (!isShallow) {
-    for (const [sha, tokens] of ACCEPTED_LEGACY) {
-      for (const digest of tokens.keys()) {
-        /*
-         * `seenLegacy` holds `sha\u0000token`, and the digest is what we have here.
-         * Reconstruct the check by testing whether any recorded token in that commit
-         * hashes to this digest.
-         */
-        const found = [...seenLegacy].some((entry) => {
-          const [seenSha, seenToken] = entry.split("\u0000");
-          return seenSha === sha && seenToken !== undefined && digestToken(seenToken) === digest;
+  for (const [sha, tokens] of ACCEPTED_LEGACY) {
+    for (const digest of tokens.keys()) {
+      /*
+       * `seenLegacy` holds `sha\u0000token`, and the digest is what we have here.
+       * Reconstruct the check by testing whether any recorded token in that commit
+       * hashes to this digest.
+       */
+      const found = [...seenLegacy].some((entry) => {
+        const [seenSha, seenToken] = entry.split("\u0000");
+        return seenSha === sha && seenToken !== undefined && digestToken(seenToken) === digest;
+      });
+      if (!found) {
+        violations.push({
+          file: sha.slice(0, 12),
+          category:
+            `accepted legacy status code is no longer present (${digest.slice(0, 12)}…) — remove the ` +
+            "entry from ACCEPTED_LEGACY (a stale acceptance would let a future reintroduction through)",
         });
-        if (!found) {
-          violations.push({
-            file: sha.slice(0, 12),
-            category:
-              `accepted legacy status code is no longer present (${digest.slice(0, 12)}…) — remove the ` +
-              "entry from ACCEPTED_LEGACY (a stale acceptance would let a future reintroduction through)",
-          });
-        }
       }
     }
   }
