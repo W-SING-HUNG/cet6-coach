@@ -1,5 +1,6 @@
-import { describe, expect, it, beforeEach, afterAll } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { describe, expect, it, beforeEach, afterAll, afterEach } from "vitest";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { TempCleanupError } from "../tools/temp-workspace.mjs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -38,6 +39,202 @@ let db: DatabaseSync;
 let repos: Repositories;
 let contentRoot: string;
 
+/*
+ * ── The environment variable must be **restored**, not merely deleted ──
+ *
+ * `beforeEach` sets `CET6_CONTENT_ROOT`; the previous `afterEach` did
+ * `delete process.env.CET6_CONTENT_ROOT`. That is correct only when the variable
+ * was unset to begin with. If the surrounding shell exports it (a developer
+ * running the suite with a content root configured, or another test file in the
+ * same worker), deleting it destroys state this file never owned, and every later
+ * test in that worker sees a different environment than it started with.
+ */
+const ORIGINAL_CONTENT_ROOT = process.env.CET6_CONTENT_ROOT;
+
+/**
+ * ── Why cleanup is per-test, and why its failure fails the test ──
+ *
+ * `beforeEach` creates a fresh temporary directory *and* a fresh native SQLite
+ * handle for every test, but the original cleanup ran only from
+ * `process.on("exit")` and only removed the **last** `repoDir` — so running the
+ * file left one directory per test behind. Measured: a full suite run accumulated
+ * dozens of `cet6-expert-*` directories.
+ *
+ * Two further defects were in that cleanup, both found in review:
+ *
+ *   1. The `catch` printed a line beginning with `FAIL` and then **continued**.
+ *      Nothing failed: the test counted as passed and the process exited 0 while a
+ *      directory stayed behind. A log line is not a verdict.
+ *   2. `repoDir = ""` ran unconditionally, so after a failed removal the reference
+ *      was lost and the exit hook had nothing left to retry. The leftover became
+ *      untracked at exactly the moment tracking mattered.
+ *
+ * So: removal failure now **throws**, which fails the test, and the reference is
+ * only cleared once the directory is verifiably gone. On failure the path stays
+ * registered with the shared helper, so the process-exit handler makes one more
+ * attempt — the two layers do not conflict because `rmSync(..., {force:true})` on
+ * an absent path is a no-op.
+ */
+afterEach(() => {
+  /*
+   * ── Structure: every step must run even if an earlier one fails ──
+   *
+   * The previous version ran close → assertRemoved → restoreEnv in sequence. When
+   * `assertRemoved` threw, the environment restore never executed, so
+   * `CET6_CONTENT_ROOT` stayed pointing at the doomed per-test directory —
+   * measured: after a failed cleanup the variable held the test's own path instead
+   * of the pre-test value (or instead of being absent). Every later test in that
+   * worker then saw a different environment than it started with.
+   *
+   * A `finally` is the reliable structure, and it is deliberately outermost: the
+   * environment restore must not depend on whether the database closed or the
+   * directory was removed. Failures are collected rather than replacing each
+   * other, so the original verdict and the cleanup evidence both survive.
+   *
+   * Ordering is also deliberate: the native handle closes **before** the tree is
+   * deleted, because on Windows an open handle keeps the containing directory busy
+   * and that is precisely how such a removal fails intermittently.
+   */
+  let failure: unknown;
+
+  /* 1. Close the native handle first. */
+  try {
+    closeDatabaseHandle();
+  } catch (error) {
+    failure = error;
+  }
+
+  /* 2. Remove the directory, preserving ownership if it survives. */
+  try {
+    if (repoDir) {
+      assertRemoved(repoDir);
+      /* Cleared only once verifiably gone, so a leftover stays registered. */
+      repoDir = "";
+    }
+  } catch (error) {
+    if (failure === undefined) {
+      failure = error;
+    } else {
+      /* Both failed: keep the original as primary, retain the secondary too. */
+      attachSecondaryError(failure, error);
+    }
+  } finally {
+    /* 3. Restore the environment — unconditionally, whatever happened above. */
+    restoreContentRootEnv();
+  }
+
+  if (failure !== undefined) throw failure;
+});
+
+/**
+ * Close the SQLite handle, distinguishing "already closed" from a real fault.
+ *
+ * `db.close()` on an already-closed handle is expected here (the `afterAll` sweep
+ * closes it again), so that specific condition is tolerated. Any *other* error is
+ * real and must not be swallowed: the previous `catch {}` hid every failure,
+ * including ones that would explain a later removal failure.
+ */
+function closeDatabaseHandle(): void {
+  try {
+    db?.close();
+  } catch (error) {
+    /*
+     * `node:sqlite` raises this for a handle that is already closed. Tolerate only
+     * that shape; re-raise everything else so a genuine fault is not masked.
+     */
+    const code = (error as { code?: unknown } | null)?.code;
+    const message = error instanceof Error ? error.message : "";
+    const alreadyClosed =
+      code === "ERR_INVALID_STATE" || /database is not open|already closed/i.test(message);
+    if (!alreadyClosed) throw error;
+  }
+}
+
+/**
+ * Restore `CET6_CONTENT_ROOT` to exactly what it was before the file ran.
+ *
+ * Deleting it unconditionally was wrong whenever the surrounding shell exported it:
+ * that destroys state this file never owned. Restoring the captured value (or
+ * deleting when it was absent) is the only form correct in both cases.
+ */
+function restoreContentRootEnv(): void {
+  if (ORIGINAL_CONTENT_ROOT === undefined) {
+    delete process.env.CET6_CONTENT_ROOT;
+    return;
+  }
+  process.env.CET6_CONTENT_ROOT = ORIGINAL_CONTENT_ROOT;
+}
+
+/**
+ * Attach a secondary failure to the primary one without losing either.
+ *
+ * The primary is re-thrown by the caller, so it stays the visible verdict; the
+ * secondary rides along on `cleanupError` and is also printed, because a cleanup
+ * problem that only exists inside an object nobody inspects has not been reported.
+ */
+function attachSecondaryError(primary: unknown, secondary: unknown): void {
+  if (primary !== null && typeof primary === "object") {
+    try {
+      (primary as { cleanupError?: unknown }).cleanupError = secondary;
+    } catch {
+      /* a frozen error object must not lose the secondary entirely */
+    }
+  }
+  const text = secondary instanceof Error ? secondary.message : String(secondary);
+  console.error(`FAIL  (secondary) ${text}`);
+}
+
+/**
+ * Remove `dir` and fail loudly if it survives.
+ *
+ * "Did not throw" is not "is gone": `rmSync` can return while the path remains (a
+ * busy handle on Windows, a partially removed tree). The verdict is the existence
+ * check, not the absence of an exception.
+ *
+ * ── Why the underlying error text is NOT included ──
+ *
+ * A Node filesystem error's message embeds the absolute path it failed on
+ * (`EPERM: operation not permitted, rmdir '<drive>:\Users\<account>\AppData\...'`).
+ * Concatenating it into our own error put the local account path into a test
+ * failure that CI publishes. Only a whitelisted error code is carried through —
+ * the same rule `tools/temp-workspace.mjs` applies — because the code identifies
+ * the *kind* of failure without disclosing the location.
+ */
+function assertRemoved(dir: string): void {
+  let failureCode = "CLEANUP_FAILED";
+  try {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 40 });
+  } catch (error) {
+    failureCode = safeErrorCode(error);
+  }
+  if (existsSync(dir)) {
+    /* The code is passed directly: no cause object is retained, by design. */
+    throw new TempCleanupError(redactForLog(dir), undefined, failureCode);
+  }
+}
+
+/**
+ * Reduce a filesystem error to a short, safe code.
+ *
+ * Mirrors the allow-list in `tools/temp-workspace.mjs`: a known code passes
+ * through, anything else becomes `CLEANUP_FAILED`. The list is duplicated rather
+ * than imported because this file's assertions run under the test runner and the
+ * helper's internal table is not part of its public surface.
+ */
+function safeErrorCode(error: unknown): string {
+  const ALLOWED = new Set([
+    "EACCES", "EBUSY", "EEXIST", "EISDIR", "EMFILE", "ENOENT",
+    "ENOTDIR", "ENOTEMPTY", "EPERM", "EROFS",
+  ]);
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" && ALLOWED.has(code) ? code : "CLEANUP_FAILED";
+}
+
+/** Redact the account-bearing prefix; only the generated leaf name is shown. */
+function redactForLog(dir: string): string {
+  return `<temp>/${dir.split(/[\\/]/).filter(Boolean).pop() ?? ""}`;
+}
+
 beforeEach(() => {
   repoDir = mkdtempSync(join(tmpdir(), "cet6-expert-"));
   contentRoot = join(repoDir, "content");
@@ -45,7 +242,7 @@ beforeEach(() => {
   db = createTestDb();
   repos = createSqliteRepositories(db);
 
-  // 导入一份完整夹具试卷，得到一个真实的"试卷 → 大题 → 题目"结构
+  /* 导入一份完整夹具试卷，得到一个真实的"试卷 → 大题 → 题目"结构 */
   const fixture = buildFixturePackage({ id: "fixture-cet6-2024-12-set1" });
   writeFixturePackage(contentRoot, "2024-12-set1", fixture);
   const result = runImport(repos, { dryRun: false });
@@ -1235,13 +1432,37 @@ describe("answer_changed 只记录真正改过的答案", () => {
   });
 });
 
-// 清理：测试结束删除临时目录（Windows 上可能残留，不影响断言）
+/*
+ * Exit-time safety net for the case where `afterEach` never ran — the test file
+ * threw during collection, or the process was ended before the hook completed.
+ *
+ * ── Why this does NOT ignore errors ──
+ *
+ * The previous version wrapped removal in `catch { /* ignore *\/ }`, so a failed
+ * removal at exit produced no signal at all: exit code 0, one log line, a
+ * directory left on disk. It now reports and sets a **non-zero** exit code, and
+ * only raises a zero code (never overwrites a real failure's code — measured
+ * behaviour: assigning `process.exitCode` in an exit handler is honoured and can
+ * also *lower* an existing value, so an unconditional assignment would erase a
+ * genuine failure's status).
+ *
+ * This handler is a backstop, not a guarantee: it does not run on SIGKILL, machine
+ * reset or power loss, and no cleanup is claimed for those cases.
+ */
 process.on("exit", () => {
-  if (repoDir) {
+  if (!repoDir) return;
+  if (existsSync(repoDir)) {
+    const shown = redactForLog(repoDir);
     try {
-      rmSync(repoDir, { recursive: true, force: true });
+      rmSync(repoDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 40 });
     } catch {
-      /* 忽略 */
+      /* reported below via the existence check, which is the real verdict */
+    }
+    if (existsSync(repoDir)) {
+      console.error(`FAIL  temporary workspace could not be removed at exit: ${shown}`);
+      if (process.exitCode === undefined || process.exitCode === 0) {
+        process.exitCode = 1;
+      }
     }
   }
 });
@@ -1257,11 +1478,14 @@ process.on("exit", () => {
  * The same defect produced an intermittent full-suite crash in
  * `course-reveal-endpoint.test.ts`; fixing only that file would have removed one
  * symptom and left the class in place.
+ *
+ * Per-test handles are closed in `afterEach` now, so this is the final sweep and
+ * is expected to find the handle already closed.
  */
 afterAll(() => {
   // 原生句柄必须确定性关闭：`DatabaseSync` 不是 GC 会及时回收的普通对象。
   try {
-    db.close();
+    db?.close();
   } catch {
     // 已关闭过就不该让清理失败。
   }

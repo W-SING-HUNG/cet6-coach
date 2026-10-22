@@ -24,10 +24,10 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { copyFileSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createTempDir } from "./temp-workspace.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..");
@@ -57,7 +57,7 @@ function check(label, condition, detail = "") {
  * they must exist before `git init` creates `.git`, and a caller that deletes the
  * tree must not be able to remove them mid-sequence.
  */
-const ISOLATED_GIT_ROOT = mkdtempSync(join(tmpdir(), "gate-ctl-gitcfg-"));
+const ISOLATED_GIT_ROOT = createTempDir("gate-ctl-gitcfg-").path;
 const ISOLATED_GIT_ENV = {
   ...process.env,
   GIT_CONFIG_GLOBAL: join(ISOLATED_GIT_ROOT, "global-config"),
@@ -90,7 +90,7 @@ function gitIn(directory, args) {
  *   history to change.
  */
 function makeTree(mutate, afterCommit) {
-  const scratch = mkdtempSync(join(tmpdir(), "gate-ctl-"));
+  const scratch = createTempDir("gate-ctl-").path;
   const SYNTHETIC_HOLDER = "Synthetic Control";
 
   writeFileSync(
@@ -820,7 +820,7 @@ function expectPlanted(planted, original) {
 {
   /** A fake `.next/` with a browser asset and a server-side map. */
   function makeBuildDir(plantBrowser, plantServerMap) {
-    const dir = mkdtempSync(join(tmpdir(), "bundle-ctl-"));
+    const dir = createTempDir("bundle-ctl-").path;
     mkdirSync(join(dir, "static", "chunks"), { recursive: true });
     mkdirSync(join(dir, "server", "chunks"), { recursive: true });
     mkdirSync(join(dir, "server", "app"), { recursive: true });
@@ -1030,7 +1030,7 @@ function expectPlanted(planted, original) {
 
   /** Build a synthetic repo with one committed root, then let the caller mutate it. */
   function makeAuditTree(mutate) {
-    const scratch = mkdtempSync(join(tmpdir(), "audit-ctl-"));
+    const scratch = createTempDir("audit-ctl-").path;
     gitIn(scratch, ["init", "-q"]);
     gitIn(scratch, ["config", "user.email", "maintainer@users.noreply.github.com"]);
     gitIn(scratch, ["config", "user.name", "CET6 Coach Maintainer"]);
@@ -1074,7 +1074,7 @@ function expectPlanted(planted, original) {
   //     people to ignore a gate.
   {
     const origin = makeAuditTree();
-    const clone = mkdtempSync(join(tmpdir(), "audit-clone-"));
+    const clone = createTempDir("audit-clone-").path;
     try {
       gitIn(clone, ["clone", "-q", origin, "."]);
       const { exitCode } = runObjectAudit(clone);
@@ -1109,7 +1109,7 @@ function expectPlanted(planted, original) {
    * Both revisions contain the forbidden name, only the older one is out of HEAD.
    */
   {
-    const dir = mkdtempSync(join(tmpdir(), "audit-exempt-"));
+    const dir = createTempDir("audit-exempt-").path;
     try {
       gitIn(dir, ["init", "-q"]);
       gitIn(dir, ["config", "user.email", "maintainer@users.noreply.github.com"]);
@@ -1157,6 +1157,96 @@ function expectPlanted(planted, original) {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+}
+
+/*
+ * ── control 26: an underscore-joined internal status code must be refused ──
+ *
+ * The defect class: every rule in the token table matched **space-separated
+ * attribution** (`<role> review round 3`, `reviewed by <Name>`, `<ROLE> PASS`).
+ * An internal acceptance code is one underscore-joined identifier, so the whole
+ * family was invisible — which is how one reached public `master` inside a merge
+ * commit's body.
+ *
+ * Three directions, because any one alone proves too little:
+ *
+ *   26a  a synthetic status code in published prose is REFUSED, for that reason;
+ *   26b  the refusal does not echo the code (a CI log is as public as the repo);
+ *   26c  neutral engineering prose and constant names stay GREEN — a rule that
+ *        fires on correct writing gets switched off, which is how guards die.
+ *
+ * The code is assembled at runtime: this file is itself scanned, and planting a
+ * literal would spend the allowance that exists for the controls.
+ */
+{
+  const STATUS_CODE = ["SYNTHETICPROBE", "STAGE", "REVIEW", "APPROVED"].join("_");
+
+  // 26a / 26b: plant it in markdown prose — reader-visible, no comment tolerance.
+  {
+    const scratch = makeTree((dir) => {
+      writeFileSync(
+        join(dir, "NOTES.md"),
+        `# Notes\n\nMerged after sign-off: ${STATUS_CODE}.\n`,
+        "utf8",
+      );
+    });
+    const { code, output } = runGateDetailed(scratch);
+
+    /*
+     * Assert the *reason*, not merely a non-zero exit: a ReferenceError or a
+     * missing file also exits non-zero, and a control that accepts that proves
+     * nothing about the status-code rule.
+     */
+    const { named, crashed } = checkRefusedFor(output, "underscore-joined internal status code");
+    check(
+      "control 26a: gate REFUSES an underscore-joined status code in published prose",
+      code !== 0 && named && !crashed,
+      code === 0
+        ? "ACCEPTED — the status-code rule did not fire"
+        : crashed
+          ? "CRASHED — this control was proving an exception, not a refusal"
+          : "refused by a different check",
+    );
+
+    check(
+      "control 26b: the status-code refusal does not echo the planted code",
+      !output.includes(STATUS_CODE),
+      "the planted code appeared in gate output",
+    );
+
+    rmSync(scratch, { recursive: true, force: true });
+  }
+
+  // 26c: neutral engineering prose must stay green.
+  {
+    const neutral = [
+      "# Neutral notes",
+      "",
+      "fix(tools): judge identities by disclosure, not by commit authorship model",
+      "docs: describe commit-exclusion rules without naming internal tokens",
+      "refactor(tools): detect internal-process records by shape, not by private names",
+      "Merging the three reviewed commits; no post-review changes.",
+      "Independent security review passed. No post-review changes.",
+      "Adds MIT licence; inbound = outbound.",
+      "See COURSE_MANIFEST_SCHEMA_VERSION and MAX_SAFE_INTEGER for the field names.",
+      "A runtime error such as ERR_MODULE_NOT_FOUND is handled by the loader.",
+      "",
+    ].join("\n");
+    const scratch = makeTree((dir) => {
+      writeFileSync(join(dir, "NOTES.md"), neutral, "utf8");
+    });
+    const { code, output } = runGateDetailed(scratch);
+    check(
+      "control 26c: gate ACCEPTS neutral engineering prose and constant names",
+      code === 0,
+      output
+        .split("\n")
+        .filter((line) => /status code|FAIL/.test(line))
+        .slice(0, 4)
+        .join(" | "),
+    );
+    rmSync(scratch, { recursive: true, force: true });
   }
 }
 

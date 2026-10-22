@@ -29,9 +29,9 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { createTempDir } from "./temp-workspace.mjs";
 
 function flag(name) {
   const index = process.argv.indexOf(`--${name}`);
@@ -44,7 +44,7 @@ const PORT = Number.parseInt(flag("port") ?? "3199", 10);
 const BASE = `http://127.0.0.1:${PORT}`;
 
 // Isolated state: a temporary database and content root, removed afterwards.
-const scratch = mkdtempSync(join(tmpdir(), "cet6-smoke-"));
+const scratch = createTempDir("cet6-smoke-").path;
 const dbPath = join(scratch, "cet6.db");
 /*
  * A deliberately non-default, recognisable content root.
@@ -65,7 +65,7 @@ function check(label, condition, detail = "") {
     return;
   }
   failures += 1;
-  console.error(`FAIL  ${label}${detail === "" ? "" : ` — ${detail}`}`);
+  console.error(`FAIL  ${label}${detail === "" ? "" : ` �?${detail}`}`);
 }
 
 if (!existsSync(join("scripts", "next.mjs"))) {
@@ -154,12 +154,12 @@ try {
    * The marker list covers three distinct leak shapes, not just one:
    *
    *   a. the synthetic content root planted above;
-   *   b. generic absolute-path forms (drive letter, POSIX home) — these catch
+   *   b. generic absolute-path forms (drive letter, POSIX home) �?these catch
    *      *any* server-side path, not only the one we planted;
    *   c. internal content-root directory names.
    *
    * The generic shapes are built at runtime so that this file never contains a
-   * literal that itself looks like a leaked path — otherwise the scanner would
+   * literal that itself looks like a leaked path �?otherwise the scanner would
    * (correctly) flag its own control data, and the tempting "fix" would be to
    * exempt itself, which is how scanners get neutered.
    */
@@ -179,7 +179,7 @@ try {
      * A POSIX **user home** path, not any absolute path.
      *
      * A general "absolute POSIX path" pattern also matches ordinary URLs such
-     * as `/practice/papers`, which appear in every page this app serves — and a
+     * as `/practice/papers`, which appear in every page this app serves �?and a
      * check that fires on legitimate output gets ignored. What actually
      * discloses an installation is a user home, so that is the shape that is
      * matched. The `/home/` and `/Users/` string markers above already cover
@@ -203,7 +203,7 @@ try {
    * The HTML check above is not sufficient on its own: Next.js ships an
    * additional RSC payload (the `self.__next_f.push(...)` script blocks) that is
    * a *different* serialisation of the same data. A value that is absent from
-   * the rendered markup can still be present in the payload — which is exactly
+   * the rendered markup can still be present in the payload �?which is exactly
    * the class of defect that display projection is meant to close structurally.
    */
   for (const [name, path] of [

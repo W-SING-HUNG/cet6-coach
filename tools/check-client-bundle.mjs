@@ -52,16 +52,14 @@
 import {
   closeSync,
   existsSync,
-  mkdtempSync,
   openSync,
   readFileSync,
   readdirSync,
   readSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
+import { withTempDir } from "./temp-workspace.mjs";
 
 function flag(name) {
   const index = process.argv.indexOf(`--${name}`);
@@ -157,23 +155,78 @@ function machineIdentityMarkers() {
     markers.push(home.replace(/\\/g, "/"));
   }
 
-  // Any other drive root the build wrote to. Only the drive root itself is
-  // added as a *prefix* marker, and the comparison below requires the marker to
-  // be followed by a real path segment — so `D:\` alone, or the illustrative
-  // `<drive>:\...\private-content\…` in a doc comment, does not match, while a
-  // genuinely serialised absolute build path does (it also matches the
-  // build-directory marker above).
+  // The drive the build actually ran on, together with the **first directory
+  // segment of this checkout** on that drive.
   //
-  // The ellipsis guard has to accept both the literal form (`D:\...`) and the
-  // JSON-escaped form that appears inside a source map (`D:\\...`), because the
-  // latter is what a comment quoted in `sourcesContent` actually looks like.
+  // ── The defect this replaces ──
+  //
+  // The previous version added `<drive>:\` alone as a prefix marker, so the
+  // marker was whatever drive the process happened to sit on. The self-test that
+  // proves this scanner is not vacuous writes an *illustrative* path into its
+  // probe — the OS directory `Windows` in a threat-model comment — and then
+  // requires that the illustrative path is NOT flagged. The two requirements
+  // contradicted each other on any machine whose current drive was `C:`:
+  //
+  //   cwd on `C:`  →  marker `C:\` →  the illustrative OS path matches
+  //                                 →  self-test FAILS
+  //   cwd on `D:`  →  marker `D:\` →  it does not match
+  //                                 →  self-test passes
+  //
+  // So the result depended on the drive letter, not on the tree. Reproduced by
+  // running the same script from a directory on each drive: FAIL and PASS.
+  //
+  // ── Which prefix actually discloses *this* machine ──
+  //
+  // A bare drive root is not an identifier: every Windows machine has a `C:`, and
+  // most have a `D:`. What identifies the build machine is the *first segment*
+  // under that drive — the top-level directory the checkout lives in. Anchoring
+  // on `<drive>:<sep><first segment>` keeps the marker machine-specific while
+  // making an illustrative OS path (whose first segment is OS furniture the build
+  // did not run from) fail to match on every machine.
+  //
+  // The self-test below still requires a genuinely serialised absolute build path
+  // to be detected, so narrowing the marker this way cannot make the check
+  // vacuous: `process.cwd()` and its slash-normalised form remain markers, and
+  // the drive form is now derived from this checkout's own first segment.
+  const buildSegments = build.split(/[\\/]+/).filter((segment) => segment !== "");
   const driveMatch = /^([A-Za-z]):[\\/]/.exec(build);
   if (driveMatch !== null) {
     const drive = driveMatch[1];
-    const ellipsis = `(?:${BACKSLASH}${BACKSLASH})?\\.\\.\\.`;
-    markers.push(
-      new RegExp(`${drive}:${BACKSLASH}${BACKSLASH}(?!${ellipsis})[^${BACKSLASH}s"'<>]{2,}`),
-    );
+    /*
+     * The first path segment under the drive. When the checkout sits directly at
+     * the drive root there is no segment to anchor on, and the drive-root marker
+     * is dropped rather than broadened: `process.cwd()` and its slash form
+     * already cover that case, and a bare `<drive>:\` marker would reintroduce
+     * the drive-dependent false positive.
+     */
+    const firstSegment = buildSegments.find((segment) => !/^[A-Za-z]:$/.test(segment));
+    if (firstSegment !== undefined) {
+      /*
+       * The first segment is stored under the drive, so it is matched against
+       * *both* separator forms: a serialised path doubles the separator, and the
+       * single-separator form appears in text that was not JSON-escaped. Both are
+       * real leaks of the same directory.
+       *
+       * The segment must end at a separator, whitespace, a quote, a bracket or a
+       * string delimiter — that is what keeps the marker for a directory from
+       * also matching inside a longer sibling name on the same drive (`...X`,
+       * `...Operations`), which is a different directory.
+       *
+       * Both fragments are spelled as **character classes with an explicit
+       * quantifier** (`[<bs>]{1,2}`) rather than as a bare backslash. A JS
+       * template literal emits a single backslash character, and a lone `\` in a
+       * regex source either escapes the following parenthesis (the pattern then
+       * fails to compile) or, written `<bs>{2}`, binds the quantifier to a
+       * literal brace and silently matches nothing. The class form has neither
+       * failure mode.
+       */
+      const SEGMENT_END = `[${BACKSLASH}${BACKSLASH}s"'\`<>|/,;:)\\]]`;
+      const SEPARATORS = `[${BACKSLASH}${BACKSLASH}]{1,2}`;
+      const escaped = firstSegment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      markers.push(
+        new RegExp(`${drive}:${SEPARATORS}${escaped}(?=${SEGMENT_END}|$)`, "i"),
+      );
+    }
   }
 
   return markers;
@@ -318,9 +371,15 @@ function scanFile(file, markers) {
 }
 
 // ── self-test: prove the scanner detects what it claims to ──
-{
-  const scratch = mkdtempSync(join(tmpdir(), "bundle-check-"));
-
+/*
+ * The scratch tree is created through `withTempDir`, not with a bare
+ * `mkdtempSync` + trailing `rmSync`. Every failure branch below ends in
+ * `process.exit(1)`, which does not run the trailing cleanup — that is how this
+ * tool left a `bundle-check-*` directory behind on every failing run. The helper
+ * removes the directory on the throwing path and registers an exit handler for
+ * the `process.exit` path.
+ */
+withTempDir("bundle-check-", (scratch) => {
   // Control 1: an internal directory name in a browser asset is detected.
   const probe = join(scratch, "chunk.js");
   // Assembled at runtime so this file never contains the literal it forbids.
@@ -332,15 +391,24 @@ function scanFile(file, markers) {
   }
   console.log("ok    self-test: internal directory name detected");
 
-  // Control 2: a machine-identity path is detected. Built at runtime so this
-  // file never itself contains a literal that looks like a leaked path.
+  /*
+   * Control 2: a machine-identity path on THIS machine is detected.
+   *
+   * Built from `process.cwd()` rather than from a literal, for two reasons: this
+   * file must not contain a path-shaped literal (it is scanned by its own gate),
+   * and the marker set is derived from the same value — so this control proves
+   * the derived marker actually fires. The slash-normalised form is included
+   * because a source map serialises separators doubled, and that form is what the
+   * marker's `[<bs>]{1,2}` separator run has to accept.
+   */
   const identityProbe = join(scratch, "identity.js");
   writeFileSync(
     identityProbe,
     [
       `var a = ${JSON.stringify(process.cwd())};`,
       `var b = ${JSON.stringify(process.cwd().replace(/\\/g, "/"))};`,
-      `var c = ${JSON.stringify(`${BACKSLASH}bD:${BACKSLASH}${BACKSLASH}some${BACKSLASH}${BACKSLASH}path`)};`,
+      `var c = ${JSON.stringify(`${process.cwd()}${BACKSLASH}src${BACKSLASH}probe.js`)};`,
+      `var d = ${JSON.stringify(JSON.stringify(`${process.cwd()}${BACKSLASH}src${BACKSLASH}probe.js`))};`,
     ].join("\n"),
     "utf8",
   );
@@ -353,6 +421,12 @@ function scanFile(file, markers) {
 
   // Control 2b: an *illustrative* path in a comment must NOT be flagged. This
   // is the false-positive class that would get the gate switched off.
+  //
+  // It must hold on **any** drive, which is the N-PR3-1 regression: the previous
+  // marker was `<current drive>:\`, so this illustrative OS path was flagged
+  // whenever the process sat on `C:`. The check below is identical on every
+  // drive now, because the marker is anchored on this checkout's first segment
+  // rather than on a bare drive root.
   const illustrativeProbe = join(scratch, "illustrative.js");
   writeFileSync(
     illustrativeProbe,
@@ -382,9 +456,7 @@ function scanFile(file, markers) {
     process.exit(1);
   }
   console.log("ok    self-test: server-only reference detected");
-
-  rmSync(scratch, { recursive: true, force: true });
-}
+});
 
 const assets = clientAssets();
 

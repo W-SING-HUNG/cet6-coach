@@ -15,10 +15,10 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { copyFileSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createTempDir } from "./temp-workspace.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..");
@@ -33,9 +33,17 @@ function check(label, condition, detail = "") {
   }
 }
 
-/** Synthesise a minimal tree the gate accepts, then mutate. */
+/**
+ * Synthesise a minimal tree the gate accepts, then mutate.
+ *
+ * The scratch tree is created through `createTempDir`, so it is registered with
+ * the shared cleanup facility: it is removed when the caller's `rmSync` runs, and
+ * also by the process-exit handler if a control throws or the process bails out
+ * with `process.exit(1)` first. A bare `mkdtempSync` here is what accumulated
+ * hundreds of `n1-*` directories in the temp root.
+ */
 function makeTree(mutate) {
-  const scratch = mkdtempSync(join(tmpdir(), "n1-"));
+  const scratch = createTempDir("n1-").path;
 
   writeFileSync(
     join(scratch, "package.json"),
@@ -130,7 +138,7 @@ function makeTree(mutate) {
    * `core.excludesFile` would silently change what `git add -A` picks up and make
    * the result depend on the machine, which is exactly what a control must not do.
    */
-  const configRoot = mkdtempSync(join(tmpdir(), "token-ctl-gitcfg-"));
+  const configRoot = createTempDir("token-ctl-gitcfg-").path;
   const gitEnv = {
     ...process.env,
     GIT_CONFIG_GLOBAL: join(configRoot, "global-config"),

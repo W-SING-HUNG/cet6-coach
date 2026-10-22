@@ -6,7 +6,7 @@
  *
  * `check-client-bundle.mjs` inspects a *local build directory*. It can say that
  * `.next/required-server-files.{js,json}` contain the build machine's absolute
- * path — and it must, because Next.js writes them and they cannot be configured
+ * path �?and it must, because Next.js writes them and they cannot be configured
  * away. But "a file in `.next/` contains a path" is not the question a release
  * has to answer.
  *
@@ -25,12 +25,12 @@
  *
  *   1. Build a **source archive** from the repository's own index and assert it
  *      contains no generated file, no build output and none of the forbidden
- *      classes — and that its file set matches the intended inclusion list.
+ *      classes �?and that its file set matches the intended inclusion list.
  *   2. Assert the **build output is excluded** from that archive, so the paths in
  *      `required-server-files` cannot reach a download.
  *   3. Serve the production build and assert over **HTTP** that no server-private
  *      document is reachable (`/required-server-files.json`,
- *      `/_next/required-server-files.json`, …).
+ *      `/_next/required-server-files.json`, �?.
  *
  * Every assertion is a real observation: the archive is built and its entries
  * read, the server is started and fetched. Nothing is inferred from a config
@@ -43,9 +43,9 @@
  */
 
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { createTempDir } from "./temp-workspace.mjs";
 
 const SKIP_HTTP = process.argv.includes("--skip-http");
 const JSON_OUTPUT = process.argv.includes("--json");
@@ -65,7 +65,7 @@ function git(args, options = {}) {
 }
 
 if (!existsSync(".git")) {
-  console.error("not a git repository — the archive boundary is defined over tracked files");
+  console.error("not a git repository �?the archive boundary is defined over tracked files");
   process.exit(2);
 }
 
@@ -146,7 +146,7 @@ const FORBIDDEN_IN_ARCHIVE = [
     violations.push({
       file: ".next/required-server-files.json",
       category:
-        "no build output present — this check is UNVERIFIED. Run `pnpm build` first; " +
+        "no build output present �?this check is UNVERIFIED. Run `pnpm build` first; " +
         "reporting a pass here would claim a boundary that was not tested",
     });
   } else {
@@ -196,13 +196,13 @@ if (SKIP_HTTP) {
   record("http-boundary", "server-private documents are not served over HTTP", [
     {
       file: ".next",
-      category: "no production build — HTTP boundary is UNVERIFIED (run `pnpm build`)",
+      category: "no production build �?HTTP boundary is UNVERIFIED (run `pnpm build`)",
     },
   ]);
 } else {
   const port = 3291;
   const base = `http://127.0.0.1:${port}`;
-  const scratch = mkdtempSync(join(tmpdir(), "archive-http-"));
+  const scratch = createTempDir("archive-http-").path;
   const violations = [];
 
   let server;
