@@ -118,7 +118,35 @@ jobs:
     timeout-minutes: 15
 
     steps:
+      # ── Full history is required by this job, so ask for it ──
+      #
+      # `actions/checkout@v4` fetches **one commit** unless told otherwise. That
+      # default silently hollowed out the history gate: `audit-history.mjs` scans
+      # `git log --all`, which on a depth-1 clone sees only the checked-out commit,
+      # so it printed PASS after examining 1 of the repository's commits. The
+      # object-database audit does unshallow, but it runs *after* the history audit
+      # in this job, so the clean verdict had already been issued against a
+      # truncated graph.
+      #
+      # Measured on a depth-1 clone of a four-commit probe repository whose second
+      # ancestor carried a synthetic status code: history audit → exit 0
+      # "in 1 message(s)"; object audit (unshallows); history audit again → exit 1
+      # "in 4 message(s)". The first result is the defect.
+      #
+      # `fetch-depth: 0` fetches every branch and tag, i.e. the complete reachable
+      # history, which is the only graph over which "no internal vocabulary in the
+      # history" is a true statement.
+      #
+      # This is not the only defence: `audit-history.mjs` now also unshallows
+      # itself and **fails closed** if the history is still incomplete afterwards.
+      # Both are present on purpose — the flag makes the common case correct, and
+      # the gate makes an unexpected checkout configuration loud instead of quiet.
+      # A pull_request event checks out GitHub's synthetic `refs/pull/N/merge`
+      # commit; fetching full history there yields the union of both parents'
+      # ancestry, which is exactly the range that must be audited.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Node.js
         uses: actions/setup-node@v4
