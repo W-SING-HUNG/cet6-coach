@@ -90,7 +90,18 @@ pnpm dev
 ```
 
 The development server is pinned to **port 3100** (port 3000 is often taken by
-other local projects), so open <http://localhost:3100>.
+other local projects) and binds **loopback only**, so open
+<http://127.0.0.1:3100>.
+
+> **Use `127.0.0.1`, not `localhost`.** Both names reach the same server, but a
+> browser treats them as two different origins. State-changing requests (the
+> course reveal endpoint in particular) are accepted only from the exact origin
+> the server reports as trusted, which is `127.0.0.1`. Opening
+> `http://localhost:3100` is redirected to the canonical address for ordinary
+> page loads; a write that somehow still arrives from the other name is refused
+> with a message telling you which address to use. This is deliberate: accepting
+> both names would mean accepting two origins for the one request that releases
+> private study content.
 
 On first load, `/` redirects through `/onboarding` → `/diagnostic` → `/today`.
 
@@ -98,7 +109,7 @@ For a production build:
 
 ```bash
 pnpm build
-pnpm start          # http://localhost:3100
+pnpm start          # http://127.0.0.1:3100
 ```
 
 ### First run in a clean checkout

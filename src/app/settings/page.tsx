@@ -85,11 +85,14 @@ export default async function SettingsPage() {
               pnpm dev
             </code>
             固定使用 <span className="tabular font-mono">3100</span>
-            （3000 留给其他项目）。因此开发地址是{" "}
+            （3000 留给其他项目），且只监听回环。因此开发地址是{" "}
             <code className="rounded-sm bg-surface-sunken px-1 py-0.5 font-mono text-[12px]">
-              http://localhost:3100
+              http://127.0.0.1:3100
             </code>
-            。
+            。请用这个地址打开：<code className="rounded-sm bg-surface-sunken px-1 py-0.5 font-mono text-[12px]">
+              localhost
+            </code>
+            与它在本机浏览器里是两个不同来源，写操作只接受规范地址。
           </li>
         </ul>
       </section>

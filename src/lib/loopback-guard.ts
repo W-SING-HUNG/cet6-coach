@@ -123,27 +123,70 @@ export function isLoopbackHostHeader(hostHeader: string | undefined): boolean {
   return (LOOPBACK_HOSTNAMES as readonly string[]).includes(hostname);
 }
 
+/**
+ * Host 头是否指向**规范访问地址**（即可信来源的那个主机名）。
+ *
+ * ── 它与 `isTrustedHostHeader` 的分工 ──
+ *
+ * `isTrustedHostHeader` 是**写请求**（敏感 POST）的判据：Host 与 Origin 都
+ * 必须精确等于可信来源。本函数不参与那条判定，它只用于**读请求的引导**。
+ *
+ * ── 为什么单列一个函数而不是放宽上面那个 ──
+ *
+ * `localhost` 与 `127.0.0.1` 在浏览器眼里是**两个来源**。上个版本 README
+ * 让人打开 `localhost:3100`，而服务监听并信任 `127.0.0.1:3100`，
+ * 于是课程揭示的 POST 被自己的同源守卫挡掉 —— 实测复现为
+ * 403「来源不是同一个本地服务」，界面上表现为"看不到正文"，且没有恢复路径。
+ *
+ * 修法**不是**同时信任两个主机名（那会放松敏感 POST 的同源边界），
+ * 而是让非规范主机名的读请求被**重定向到规范地址**：浏览器随后从
+ * 规范来源发起，同源判定依然精确到单一来源。判据本身没有变宽。
+ */
+export function isCanonicalHostHeader(hostHeader: string | undefined): boolean {
+  if (hostHeader === undefined || hostHeader === "") return false;
+  const raw = Array.isArray(hostHeader) ? hostHeader[0] : hostHeader;
+  if (typeof raw !== "string" || raw === "") return false;
+  const hostname = raw.startsWith("[") ? raw.slice(0, raw.indexOf("]") + 1) : raw.split(":")[0];
+  return hostname === trustedHostname();
+}
+
 /** Origin 失败的具体形态（分开是为了让响应体说清"缺"与"错"）。 */
 export type OriginRejection =
   | "origin_missing"
   | "origin_invalid"
   | "origin_not_loopback"
+  | "origin_loopback_alias"
   | "origin_not_same_origin";
 
 /**
  * 判定 Origin 头是否**精确等于**本应用的可信来源。
  *
- * ── 五种拒绝形态，逐种都有真实 HTTP 负向测试 ──
+ * ── 拒绝形态，逐种都有真实 HTTP 负向测试 ──
  *
  * | 形态 | 判据 |
  * | --- | --- |
  * | `origin_missing` | 头缺失或空 |
  * | `origin_invalid` | 不是合法绝对 URL |
  * | `origin_not_loopback` | 主机名不是回环 |
- * | `origin_not_same_origin` | 是回环但**协议/主机名/端口**与可信来源不同 |
+ * | `origin_loopback_alias` | 回环的**另一个主机名**，协议与端口都相同 |
+ * | `origin_not_same_origin` | 协议/主机名/端口中任一项与可信来源不同 |
  *
- * 最后一种是上一版完全没挡住的那一类：`http://127.0.0.1:3200` 打在
- * `:3100` 的服务上 —— 都是回环，但不是同一个来源。
+ * `origin_not_same_origin` 是上一版完全没挡住的那一类：
+ * `http://127.0.0.1:3200` 打在 `:3100` 的服务上 —— 都是回环，
+ * 但不是同一个来源。
+ *
+ * ── 为什么单独分出 `origin_loopback_alias` ──
+ *
+ * 它和"跨站写"不是同一件事：`http://localhost:3100` 与
+ * `http://127.0.0.1:3100` 都是**本机用户自己**打开的地址，只是浏览器
+ * 把它们算作两个来源。把这种情况混进 `origin_not_same_origin` 的
+ * 后果是实测过的：学习者按 README 打开 localhost，点「确认阅读」
+ * 得到一句"来源不是同一个本地服务"，界面既没说该换成哪个地址，
+ * 也没有任何恢复路径 —— 功能看起来就是坏的。
+ *
+ * 判据没有放宽：它**仍然被拒绝**，只是拒绝的理由更准确，因而能给出
+ * 一条可执行的自救指引（改用规范地址）。真正的跨站/跨端口/跨协议
+ * 仍然落在 `origin_not_same_origin` 与 `origin_not_loopback` 里。
  */
 export function classifyOrigin(originHeader: string | undefined): { ok: true } | { ok: false; reason: OriginRejection } {
   if (originHeader === undefined || originHeader === "") return { ok: false, reason: "origin_missing" };
@@ -166,6 +209,15 @@ export function classifyOrigin(originHeader: string | undefined): { ok: true } |
   // 逐项比对：协议、主机名、端口。任一项不同即不同源。
   const trusted = new URL(trustedLocalOrigin());
   if (url.protocol !== trusted.protocol || url.hostname !== trusted.hostname || url.port !== trusted.port) {
+    /*
+     * 同协议、同端口，只有主机名不同，且该主机名也是回环 ⇒ 这是
+     * "回环别名"而不是跨源写。仍拒绝，但理由更贴切（见上方说明）。
+     */
+    const sameProtocol = url.protocol === trusted.protocol;
+    const samePort = url.port === trusted.port;
+    if (sameProtocol && samePort) {
+      return { ok: false, reason: "origin_loopback_alias" };
+    }
     return { ok: false, reason: "origin_not_same_origin" };
   }
   return { ok: true };
@@ -212,7 +264,19 @@ export function guardLocalRequest(headers: {
 /** 旧名的兼容转发（避免调用方一次性全改；判据已是精确同一来源）。 */
 export const guardLoopbackRequest = guardLocalRequest;
 
-/** 失败原因 → 面向调用方的可读说明（不含任何内部细节）。 */
+/**
+ * 失败原因 → 面向调用方的可读说明（不含任何内部细节）。
+ *
+ * ── `origin_loopback_alias` 这一支的原则 ──
+ *
+ * 它**仍然拒绝**，但它给出的必须是一条**可执行**的指引：告诉使用者
+ * 换成哪个地址即可恢复。原因见 `classifyOrigin` 的说明 —— 这一支
+ * 对应的情境是"本机用户自己打开了另一个回环主机名"，不是攻击。
+ *
+ * 说明里刻意只写**规范地址**（`trustedLocalOrigin()`），不写
+ * "localhost 与 127.0.0.1 都行"之类的宽松措辞：那会让人以为两个
+ * 来源等价，反过来诱导下一次同样的失败。
+ */
 export function explainLocalRejection(
   reason: "host_not_trusted" | OriginRejection,
 ): string {
@@ -225,6 +289,8 @@ export function explainLocalRejection(
       return "这个操作只能由本应用的页面发起（来源信息无法识别，已拒绝）。";
     case "origin_not_loopback":
       return "这个操作只能由本应用的页面发起（来源不是本机，已拒绝）。";
+    case "origin_loopback_alias":
+      return `这个操作只能从本应用的规范地址发起。请改用 ${trustedLocalOrigin()} 打开本应用后重试（本机回环的其它主机名不算同一个来源，已拒绝）。`;
     case "origin_not_same_origin":
       return "这个操作只能由本应用的页面发起（来源不是同一个本地服务，已拒绝）。";
   }

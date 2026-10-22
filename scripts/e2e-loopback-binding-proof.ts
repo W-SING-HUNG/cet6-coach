@@ -74,18 +74,20 @@ function rawGet(
   port: number,
   path: string,
   hostHeader: string,
-): Promise<{ status: number; cacheControl: string | null }> {
+): Promise<{ status: number; cacheControl: string | null; body: string }> {
   return new Promise((resolve, reject) => {
     const req = httpRequest(
       { host: LOOPBACK_HOST, port, path, method: "GET", headers: { host: hostHeader } },
       (res) => {
-        res.on("data", () => {
-          // 判据是状态码与响应头，不是内容 —— 因此丢弃 body。
+        let body = "";
+        res.on("data", (chunk: Buffer) => {
+          body += chunk.toString("utf8");
         });
         res.on("end", () =>
           resolve({
             status: res.statusCode ?? 0,
             cacheControl: (res.headers["cache-control"] as string | undefined) ?? null,
+            body,
           }),
         );
       },
@@ -270,6 +272,72 @@ async function verifyInstance(label: string, port: number, probe: RevealProbe): 
     foreignHost.cacheControl === "no-store",
     foreignHost.cacheControl ?? "无",
   );
+
+  /*
+   * ── ④b 回环别名的引导（本轮新增，规范访问地址）──
+   *
+   * 缺陷回顾：README 让人打开 `localhost:<port>`，而服务监听并信任
+   * `127.0.0.1:<port>`。页面照常显示，点「确认阅读」时 POST 被 403 ——
+   * 没有任何恢复路径。这里对**真实的 Next 服务器**验证修复后的三件事，
+   * 且都用原始 `Host` 头（浏览器无法伪造该头）：
+   *
+   * 1. 别名读请求得到**清楚的结果**（不是一张看似正常的页面）；
+   * 2. 该结果里给出**规范地址**的链接，且链接指向同一个端口（不跨实例）；
+   * 3. 该结果**不含任何课程正文** —— 引导页不是内容出口。
+   */
+  if (LOOPBACK_HOST === "127.0.0.1") {
+    const aliasHost = `localhost:${port}`;
+    const aliasPage = await rawGet(port, `/practice/courses/${probe.courseId}`, aliasHost);
+
+    check(
+      "回环别名（localhost）读请求 ⇒ 得到明确的引导，而不是看似正常的页面",
+      aliasPage.status === 421,
+      `状态 ${aliasPage.status}`,
+    );
+
+    check(
+      "引导页指向规范地址",
+      aliasPage.body.includes(`http://${LOOPBACK_HOST}:${port}/`),
+      "响应体里没有规范地址链接",
+    );
+
+    check(
+      "引导页不携带任何课程正文",
+      !aliasPage.body.includes(probe.expectedText),
+      "引导页出现了正文，说明它成了内容出口",
+    );
+
+    /*
+     * 端口必须沿用请求自己的那一个：把端口写死成可信来源里的值，
+     * 在端口与配置不一致时会把使用者送到**另一个服务**上。
+     * 这里验证链接里的端口就是本实例实际监听的端口。
+     */
+    check(
+      "引导链接与本实例同端口（不跨实例）",
+      aliasPage.body.includes(`:${port}/`),
+      "引导链接里的端口与本实例不一致",
+    );
+
+    /*
+     * 别名 Host + 规范 Origin 的写请求必须仍然被拒 —— 证明"引导"
+     * 没有顺手放松同源判定（Host 判定在最前面）。
+     */
+    const aliasWrite = await rawPost(port, "/api/course/reveal", {
+      hostHeader: aliasHost,
+      originHeader: `http://${LOOPBACK_HOST}:${port}`,
+      body: JSON.stringify({
+        courseId: probe.courseId,
+        segmentId: probe.segmentId,
+        courseContentVersion: 1,
+        confirmedRiskFingerprint: "0".repeat(64),
+      }),
+    });
+    check(
+      "回环别名 Host 的写请求 ⇒ 仍被拒（引导不放宽同源边界）",
+      aliasWrite.status === 403,
+      `状态 ${aliasWrite.status}`,
+    );
+  }
 
   /*
    * ── ⑤ 同源一致性（P0-2 的核心）──
