@@ -324,15 +324,37 @@ function record(id, title, violations) {
    * still actually carry a status code. If the history is ever rewritten (or a
    * rebase changes the SHA), the entry stops matching and this fires — so the
    * acceptance cannot silently become a permanent no-op that hides a new leak.
+   *
+   * ── Why a shallow checkout is exempt from this direction ──
+   *
+   * `actions/checkout` fetches **one commit by default**. On a shallow clone the
+   * accepted commit is not in the graph at all, so "not seen" means "not fetched",
+   * not "no longer present" — the two are indistinguishable from inside the tree,
+   * and conflating them made this check red on a correct tree. That is the exact
+   * failure mode the repository already documents elsewhere: a gate that is red
+   * for a reason unrelated to the code teaches people to ignore it.
+   *
+   * So the reverse assertion only runs when the history is complete. On a shallow
+   * clone the *forward* direction still runs in full — every commit that IS present
+   * is scanned, and a status code in any of them is refused unless it is the
+   * accepted SHA. Nothing is loosened; only a question that cannot be answered
+   * from the available data is not asked.
+   *
+   * A full clone (the authoring tree, and any deep checkout) still gets both
+   * directions, which is where the rot would actually be introduced.
    */
-  for (const sha of ACCEPTED_LEGACY.keys()) {
-    if (!seenLegacy.has(sha)) {
-      violations.push({
-        file: sha.slice(0, 12),
-        category:
-          "accepted legacy status code is no longer present — remove the entry from ACCEPTED_LEGACY " +
-          "(a stale acceptance would let a future reintroduction through)",
-      });
+  const isShallow = git(["rev-parse", "--is-shallow-repository"]).trim() === "true";
+
+  if (!isShallow) {
+    for (const sha of ACCEPTED_LEGACY.keys()) {
+      if (!seenLegacy.has(sha)) {
+        violations.push({
+          file: sha.slice(0, 12),
+          category:
+            "accepted legacy status code is no longer present — remove the entry from ACCEPTED_LEGACY " +
+            "(a stale acceptance would let a future reintroduction through)",
+        });
+      }
     }
   }
 
