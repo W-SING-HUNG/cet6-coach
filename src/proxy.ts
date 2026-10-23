@@ -1,8 +1,10 @@
 import { NextResponse, type NextRequest } from "next/server";
 import {
+  classifyOrigin,
   isCanonicalHostHeader,
   isLoopbackHostHeader,
   trustedLocalOrigin,
+  type OriginRejection,
 } from "@/lib/loopback-guard";
 
 /**
@@ -19,28 +21,37 @@ import {
  * 因此 GET/HTML/RSC 也必须被挡在外面，且必须在**同一个地方**挡 ——
  * 逐个路由自己判，就等于指望"每个新路由都记得加"。
  *
- * ── 判据 ──
- *
- * 只接受 Host 属于回环的请求。这里刻意用**宽松**的回环判据
- * （`isLoopbackHostHeader`），而不是"必须等于某个端口"：
- *
- * - Host 头里的端口是**客户端**提供的，它可能因代理、端口转发而与实际
- *   监听端口不同；
- * - 而本产品可能以不同端口启动（开发 3100、各 E2E 实例 3199~3265）；
- * - 真正的**同源**判定属于带 `Origin` 的写请求，那由
- *   `lib/loopback-guard.ts` 的精确判据负责。
- *
- * 两层判据各管一件事：
+ * ── 三层判据，各管一件事 ──
  *
  * | 层 | 判据 | 挡住 |
  * | --- | --- | --- |
- * | 本文件（全部请求） | Host 是回环 | LAN 访问、DNS rebinding |
- * | 敏感 POST（`/api/course/reveal`） | Origin **精确同一来源** | 跨站写、另一个本地服务 |
+ * | 本文件（全部请求） | Host 是**回环** | LAN 访问、DNS rebinding |
+ * | 本文件（写请求） | Host **精确等于**可信 authority（主机名 + 端口）， | 跨端口伪造、别名写 |
+ * | | 且 Origin **精确等于**可信来源（必填） | 跨站写、缺失/null Origin |
+ * | 敏感端点自身（`/api/course/reveal`） | 同一套精确判据（纵深防御） | 端点级复核 |
  *
- * ── 它**不**做的事 ──
+ * ── 为什么写请求的判据必须在本文件里完成 ──
  *
- * 不做鉴权、不读数据库、不碰课程内容。它只是一道网络边界，
- * 因此对所有路由一视同仁，且保持极轻。
+ * 实测（Next 16.4.2，真实 Server Action ID + 隔离合成 SQLite）：
+ *
+ * 1. **伪造端口**：`Host: 127.0.0.1:9999` + `Origin: http://127.0.0.1:9999`
+ *    打在 `:3265` 的实例上 ⇒ **200，数据库被改**。
+ * 2. **缺失 Origin**：`Host: 127.0.0.1:3265`（规范）+ 无 `Origin`
+ *    ⇒ **200，数据库被改**。
+ *
+ * 两种都能穿过 Next 内置的 action CSRF 门禁 —— 因为它把 `Origin` 与
+ * **`Host` 头**相比（`action-handler.js` 的 `parseHostHeader(req.headers)`
+ * 不传 `originDomain`），两者都由客户端给；且 `Origin` 缺失时代码注释
+ * 明写"let this through but log a warning"。
+ *
+ * 因此框架的检查**不能**替代本项目的边界：这里自己判，且在 action
+ * 分发之前就拒，故不会有任何 action 被执行、不会产生数据库副作用。
+ *
+ * ── 为什么读请求给引导页、写请求给纯文本 ──
+ *
+ * 读请求的失败是"人走错了地址"，给一份可点的引导是安全且有用的。
+ * 写请求的失败**不应该**被渲染成页面（它不来自人肉导航），
+ * 因此返回简短纯文本 + 状态码，调用方从状态码即可判断。
  */
 
 export function proxy(request: NextRequest): NextResponse | undefined {
@@ -64,32 +75,12 @@ export function proxy(request: NextRequest): NextResponse | undefined {
   }
 
   /*
-   * ── 非规范回环主机名：一律拒绝（读与写都拒）──
+   * ── 非规范回环主机名：读给引导页、写直接拒 ──
    *
    * 回环的主机名不止一个：`127.0.0.1`、`localhost`、`[::1]`。它们都能连到
-   * 本服务，但在浏览器眼里是**不同来源**。只有规范来源能完成写操作
-   * （见 `lib/loopback-guard.ts` 的精确判据）。
+   * 本服务，但在浏览器眼里是**不同来源**。只有规范 authority 能完成写操作。
    *
-   * ── 为什么写请求必须在这里就拒，而不是留给下游 ──
-   *
-   * 实测（Next 16.4.2，真实进程内服务器 + 原始 HTTP）：
-   * Next 自己的 Server Actions CSRF 门禁把 `Origin` 与 **`Host` 头**相比
-   * （`action-handler.js` 的 `parseHostHeader(req.headers)` 不传
-   * `originDomain`，于是直接采信客户端给的值）。当两者都写成同一个
-   * 别名（`Host: localhost:3265` + `Origin: http://localhost:3265`）时，
-   * 该门禁**通过**，action 正常执行并**写入了数据库**
-   * （实测：`weekday_minutes` 由 60 变为 137，`updated_at` 同步更新）。
-   *
-   * 也就是说：别名的写通路**不是**理论推断，是实测存在的。下游端点
-   * 并非都像 `/api/course/reveal` 那样自己做精确 Origin 校验，因此
-   * 统一边界必须自己兜住 —— 这正是本文件存在的理由。
-   * 在这里拒绝，就不会有任何 action 被执行、不会产生任何数据库副作用。
-   *
-   * ── 为什么读请求给引导页、写请求给纯文本 ──
-   *
-   * 读请求的失败是"人走错了地址"，给一份可点的引导是安全且有用的。
-   * 写请求的失败**不应该**被渲染成页面（它不来自人肉导航），
-   * 因此返回简短纯文本 + 状态码，调用方从状态码即可判断。
+   * 详细的实测依据见文件头注释（伪造端口、缺失 Origin 两条真实写入缺口）。
    */
 
   /** 规范来源（协议 + 主机名 + 端口）——**完全由部署配置决定**。 */
@@ -98,44 +89,92 @@ export function proxy(request: NextRequest): NextResponse | undefined {
   const method = request.method.toUpperCase();
   const isReadMethod = method === "GET" || method === "HEAD";
 
-  if (!isCanonicalHostHeader(host ?? undefined)) {
-    if (isReadMethod) {
-      /*
-       * ── 规范链接：**只**从 `trustedLocalOrigin()` 拼出 ──
-       *
-       * 历史缺陷（本轮修复）：上一版把 Host 头里的端口拿来拼引导链接，
-       * 于是 `Host: localhost:9999` 打在本服务上会生成
-       * `http://127.0.0.1:9999/...` —— 一个指向**另一项本地服务**的链接。
-       * 这不仅违背"可信来源不能来自客户端请求头"的设计原则，
-       * 而且会把使用者引导到别的进程上去（那看起来像是成功了）。
-       *
-       * 因此现在：协议、主机名、端口**三者全部**取自 `trustedLocalOrigin()`。
-       * 请求只能贡献经过处理的**路径与查询**。
-       *
-       * 多实例（开发 3100、E2E 3199~3265）仍然正确：每个实例都通过
-       * `PORT` 或 `CET6_LOCAL_ORIGIN` 声明自己的来源，`trustedLocalOrigin()`
-       * 因此返回**该实例自己**的端口，不是全局写死的 3100。
-       */
-      const canonicalUrl = `${canonical.origin}${safePathAndQuery(request)}`;
-      return canonicalAddressGuidance(canonicalUrl);
+  /*
+   * ── 读方法：只要求 Host 是规范 authority ──
+   *
+   * 写方法走下面更严格的路径（Host 精确 + Origin 必填），因此这里
+   * 先用"是不是读方法"分流，而不是先判 Host 再判方法 —— 顺序反了
+   * 就会出现"Host 不匹配的写请求先拿到 421 引导页"这种错配。
+   */
+  if (isReadMethod) {
+    if (isCanonicalHostHeader(host ?? undefined)) {
+      /* 规范地址的读请求：放行。 */
+      return undefined;
     }
 
     /*
-     * 写请求（POST / PUT / PATCH / DELETE 等）：失败关闭，不引导、
-     * 不转发、不执行。响应体不含任何私人内容。
+     * ── 规范链接：**只**从 `trustedLocalOrigin()` 拼出 ──
+     *
+     * 历史缺陷：更早一版把 Host 头里的端口拿来拼引导链接，于是
+     * `Host: localhost:9999` 打在本服务上会生成
+     * `http://127.0.0.1:9999/...` —— 一个指向**另一项本地服务**的链接。
+     *
+     * 因此现在：协议、主机名、端口**三者全部**取自 `trustedLocalOrigin()`。
+     * 请求只能贡献经过处理的**路径与查询**。
+     *
+     * 多实例（开发 3100、E2E 3199~3265）仍然正确：每个实例都通过
+     * `PORT` 或 `CET6_LOCAL_ORIGIN` 声明自己的来源，`trustedLocalOrigin()`
+     * 因此返回**该实例自己**的端口，不是全局写死的 3100。
+     *
+     * 注意：能够走到这里的只有"回环但不是规范 authority"的情形
+     * （非回环 Host 已在上面 421 掉了）。给引导页是有用的，因为那是
+     * 人走错了地址。
      */
-    return new NextResponse("这个操作只能从本应用的规范本地地址发起。", {
-      status: 403,
-      headers: {
-        "content-type": "text/plain; charset=utf-8",
-        "cache-control": "no-store",
-        "x-content-type-options": "nosniff",
-        "referrer-policy": "no-referrer",
-      },
-    });
+    const canonicalUrl = `${canonical.origin}${safePathAndQuery(request)}`;
+    return canonicalAddressGuidance(canonicalUrl);
+  }
+
+  /*
+   * ── 写方法：Host 精确匹配 + Origin 必填且精确匹配 ──
+   *
+   * 两条都必须过，顺序是 Host 先（Host 不过说明请求没打到本服务上，
+   * 此时谈 Origin 没有意义）。任一不过 ⇒ 失败关闭，不转发、不执行。
+   */
+
+  /* ① Host 必须是可信 authority（主机名 **与端口** 都精确相等）。 */
+  if (!isCanonicalHostHeader(host ?? undefined)) {
+    return writeRejected("host");
+  }
+
+  /*
+   * ② Origin 必须存在且精确等于可信来源。
+   *
+   * `classifyOrigin` 会对 missing / invalid / null / 非回环 / 别名 /
+   * 跨端口 / 跨协议 分别给出拒绝理由，全部拒绝。这里**不**使用任何
+   * allowedOrigins 白名单 —— 只接受唯一一个可信来源。
+   */
+  const origin = classifyOrigin(request.headers.get("origin") ?? undefined);
+  if (!origin.ok) {
+    return writeRejected(origin.reason);
   }
 
   return undefined;
+}
+
+/**
+ * 写请求的拒绝响应（唯一实现）。
+ *
+ * ── 为什么不区分理由给不同文案 ──
+ *
+ * 写请求不应由人肉导航触发，因此它的响应不是给人读的引导页；而
+ * **把具体拒绝理由回给调用方**会让探测变得容易（例如"缺 Origin"与
+ * "Origin 不对"分开回答，就能二分出可信来源的形态）。
+ * 因此对外统一一句，理由只留在服务端日志/测试断言里。
+ *
+ * `reason` 参与签名是为了让调用点显式记录**为什么**拒，
+ * 并在测试中可断言；它不出现在响应体里。
+ */
+function writeRejected(reason: "host" | OriginRejection): NextResponse {
+  void reason;
+  return new NextResponse("这个操作只能从本应用的规范本地地址发起。", {
+    status: 403,
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+    },
+  });
 }
 
 /**

@@ -121,16 +121,75 @@ describe("规范访问地址 · 拒绝是可恢复的", () => {
   });
 });
 
-describe("规范访问地址 · 主机名判定", () => {
-  it("只有可信来源的主机名算规范地址", () => {
+describe("规范访问地址 · authority 判定（主机名 + 端口）", () => {
+  /*
+   * ── 本轮修正的缺陷 A ──
+   *
+   * 旧断言写 `expect(isCanonicalHostHeader("127.0.0.1")).toBe(true)` ——
+   * 那是"只比 hostname、忽略端口"的语义。独立审查用真实 Server Action
+   * 实测：`Host: 127.0.0.1:9999` + 匹配伪端口的 Origin ⇒ 200 且**改了数据库**。
+   *
+   * 因此这里不是"改断言让它变绿"，而是把判据换成正确的、更严格的那一条：
+   * 端口参与判定，缺失端口不再等价于"任意端口"。
+   */
+  it("可信 authority 由主机名与端口共同决定", () => {
     expect(trustedHostname()).toBe("127.0.0.1");
+
+    // 完整的规范 authority ⇒ 通过
     expect(isCanonicalHostHeader(`127.0.0.1:${PORT}`)).toBe(true);
-    expect(isCanonicalHostHeader("127.0.0.1")).toBe(true);
+
+    /*
+     * 缺端口 ⇒ **不**通过。可信来源是 `:3100`；`127.0.0.1`（无端口）
+     * 在 HTTP 语义里指 80 端口 —— 那是另一个监听者。
+     * 旧版把它当 true，正是缺陷 A 的一半成因。
+     */
+    expect(
+      isCanonicalHostHeader("127.0.0.1"),
+      "缺端口不等于可信端口（默认端口是 80，不是 3100）",
+    ).toBe(false);
+
     expect(isCanonicalHostHeader(`localhost:${PORT}`)).toBe(false);
     expect(isCanonicalHostHeader("[::1]:3100")).toBe(false);
     expect(isCanonicalHostHeader("evil.example")).toBe(false);
     expect(isCanonicalHostHeader(undefined)).toBe(false);
     expect(isCanonicalHostHeader("")).toBe(false);
+  });
+
+  it("端口伪造一律拒绝（缺陷 A 的核心负向控制）", () => {
+    /*
+     * 这是 Reviewer 实际利用的那条路径：主机名正确、端口伪造。
+     * 每一个都必须为 false —— 否则错误端口会被当成规范地址放行写入。
+     */
+    for (const port of ["9999", "3101", "1", "65535", "3250", "80"]) {
+      expect(
+        isCanonicalHostHeader(`127.0.0.1:${port}`),
+        `伪造端口 ${port} 不得被判为规范地址`,
+      ).toBe(false);
+    }
+  });
+
+  it("畸形 Host 失败关闭（解析器不得产生歧义）", () => {
+    /*
+     * 这些形态的共同点是"不同解析器会得出不同结论"。安全边界只能取
+     * 交集，因此一律拒绝，而不是猜一个解释。
+     */
+    const malformed = [
+      "127.0.0.1:abc", // 端口非数字
+      "127.0.0.1:99999", // 端口越界
+      "127.0.0.1:0", // 端口 0
+      "127.0.0.1:", // 冒号后为空
+      "127.0.0.1:3100:3100", // 多个冒号（走私形态）
+      "::1:3100", // 裸 IPv6 缺方括号
+      " 127.0.0.1:3100", // 前导空白
+      "127.0.0.1:3100 ", // 尾随空白
+      "[::1", // 方括号未闭合
+    ];
+    for (const host of malformed) {
+      expect(
+        isCanonicalHostHeader(host),
+        `${JSON.stringify(host)} 必须被拒绝`,
+      ).toBe(false);
+    }
   });
 
   it("规范地址判定不接受主机名相似的伪造", () => {

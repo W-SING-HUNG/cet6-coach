@@ -233,3 +233,155 @@ describe("统一边界 · 别名写请求在统一层拒绝", () => {
     expect(result?.headers.get("cache-control")).toBe("no-store");
   });
 });
+
+/*
+ * ════════════════════════════════════════════════════════════════════════
+ * 缺陷 A 与缺陷 B 的定向回归
+ * ════════════════════════════════════════════════════════════════════════
+ *
+ * 独立审查用**真实 Server Action ID + 合成 SQLite** 实测到两条写入缺口：
+ *
+ *   A. `Host: 127.0.0.1:9999` + `Origin: http://127.0.0.1:9999`
+ *      ⇒ 200，数据库被改（旧判据只比 hostname）
+ *   B. 规范 `Host` + **缺失 Origin**
+ *      ⇒ 200，数据库被改（旧 proxy 只对读方法调用了判据）
+ *
+ * 下面把这两条各自的**最小判据**固定在单元层。运行时（真实进程 + 真实
+ * action id + 数据库前后对比）的那一层在
+ * `scripts/e2e-loopback-binding-proof.ts`。
+ */
+
+describe("缺陷 A · 规范主机名 + 伪造端口不得通过", () => {
+  it("写请求：主机名正确但端口伪造 ⇒ 403", () => {
+    /*
+     * 这一条是 Reviewer 的原始利用形态。判据必须在 Host 上就拦住，
+     * 不能指望 Origin（它能被伪造成与 Host 一致）。
+     */
+    for (const forged of ["9999", "3101", "3250", "1", "65535"]) {
+      const result = proxy(
+        request("POST", "/settings", `127.0.0.1:${forged}`, {
+          // Origin 主动写成与伪端口**一致**，模拟攻击者让两者相等
+          origin: `http://127.0.0.1:${forged}`,
+          "next-action": "0".repeat(40),
+        }),
+      );
+      expect(result, `伪端口 ${forged} 的写请求必须被拒`).toBeDefined();
+      expect(result!.status, `伪端口 ${forged}`).toBe(403);
+    }
+  });
+
+  it("读请求：伪造端口 ⇒ 给引导页（而不是当成规范地址放行）", async () => {
+    const result = proxy(
+      request("GET", "/practice/courses", "127.0.0.1:9999"),
+    );
+    expect(result?.status).toBe(421);
+    const body = await result!.text();
+    // 引导链接必须指向**真实**可信端口，不是伪端口
+    expect(linkFrom(body)).toBe(`${CANONICAL}/practice/courses`);
+  });
+
+  it("缺端口的 Host 不算规范地址", () => {
+    /*
+     * `127.0.0.1`（无端口）在 HTTP 语义里是 80 端口，不是 3100。
+     * 旧版把它当规范地址；现在必须拒绝写请求。
+     */
+    const result = proxy(
+      request("POST", "/settings", "127.0.0.1", { origin: CANONICAL }),
+    );
+    expect(result?.status).toBe(403);
+  });
+
+  it("规范 authority（主机名 + 正确端口）仍然放行", () => {
+    const result = proxy(
+      request("POST", "/settings", `127.0.0.1:${PORT}`, { origin: CANONICAL }),
+    );
+    expect(result, "正确端口不得被误伤").toBeUndefined();
+  });
+});
+
+describe("缺陷 B · 写请求必须带精确匹配的 Origin", () => {
+  it("缺失 Origin ⇒ 403（缺省不是放行）", () => {
+    const result = proxy(
+      request("POST", "/settings", `127.0.0.1:${PORT}`, {
+        "next-action": "0".repeat(40),
+      }),
+    );
+    expect(result, "缺失 Origin 必须失败关闭").toBeDefined();
+    expect(result!.status).toBe(403);
+  });
+
+  it("Origin: null ⇒ 403", () => {
+    const result = proxy(
+      request("POST", "/settings", `127.0.0.1:${PORT}`, { origin: "null" }),
+    );
+    expect(result?.status).toBe(403);
+  });
+
+  it("无效 Origin ⇒ 403", () => {
+    for (const bad of ["not a url", "https:", "", "//evil.example"]) {
+      const result = proxy(
+        request("POST", "/settings", `127.0.0.1:${PORT}`, { origin: bad }),
+      );
+      expect(result?.status, `Origin ${JSON.stringify(bad)} 必须被拒`).toBe(403);
+    }
+  });
+
+  it("跨端口 Origin ⇒ 403", () => {
+    const result = proxy(
+      request("POST", "/settings", `127.0.0.1:${PORT}`, {
+        origin: `http://127.0.0.1:${PORT + 1}`,
+      }),
+    );
+    expect(result?.status).toBe(403);
+  });
+
+  it("跨协议 Origin ⇒ 403", () => {
+    const result = proxy(
+      request("POST", "/settings", `127.0.0.1:${PORT}`, {
+        origin: `https://127.0.0.1:${PORT}`,
+      }),
+    );
+    expect(result?.status).toBe(403);
+  });
+
+  it("外部 Origin ⇒ 403", () => {
+    for (const bad of ["https://evil.example", "http://192.168.1.5:3100"]) {
+      const result = proxy(
+        request("POST", "/settings", `127.0.0.1:${PORT}`, { origin: bad }),
+      );
+      expect(result?.status, `Origin ${bad} 必须被拒`).toBe(403);
+    }
+  });
+
+  it("别名 Origin（localhost）⇒ 403，即使 Host 是规范地址", () => {
+    const result = proxy(
+      request("POST", "/settings", `127.0.0.1:${PORT}`, {
+        origin: `http://localhost:${PORT}`,
+      }),
+    );
+    expect(result?.status).toBe(403);
+  });
+
+  it("精确匹配的 Origin 仍然放行（不误伤合法浏览器写入）", () => {
+    for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+      const result = proxy(
+        request(method, "/settings", `127.0.0.1:${PORT}`, {
+          origin: CANONICAL,
+          "next-action": "0".repeat(40),
+        }),
+      );
+      expect(result, `${method} + 精确 Origin 必须放行`).toBeUndefined();
+    }
+  });
+
+  it("写请求的拒绝不给引导链接（避免把写请求渲染成可点的页面）", async () => {
+    for (const headers of [{}, { origin: "null" }, { origin: "https://evil.example" }]) {
+      const result = proxy(
+        request("POST", "/settings", `127.0.0.1:${PORT}`, headers as Record<string, string>),
+      );
+      const body = await result!.text();
+      expect(body).not.toContain("<a href=");
+      expect(body).not.toContain("<html");
+    }
+  });
+});

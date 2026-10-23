@@ -25,7 +25,8 @@
 import { createConnection } from "node:net";
 import { request as httpRequest } from "node:http";
 import { spawn, execSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import {
   E2E_LOOPBACK_PROOF_PORT,
   E2E_LOOPBACK_PROOF_DEV_PORT,
@@ -618,6 +619,250 @@ async function seedProbeData(): Promise<RevealProbe> {
   return { courseId, segmentId, fingerprint: risk.fingerprint, expectedText };
 }
 
+/* ─────────────────────────── Server Action 写入矩阵 ─────────────────────────── */
+
+/**
+ * 从构建产物里读出 `/settings` 页面的**真实** Server Action ID。
+ *
+ * ── 为什么必须真实，不能随便编一个 ──
+ *
+ * 用一个伪造的 action id 去打端点，得到 400/500 也"看起来像被拒绝了" ——
+ * 但那时的拒绝来自"action 不存在"，**不是**来自来源判据。
+ * 那种测试会让真正的缺口通过：缺口正是"action 能被执行并写库"。
+ * 因此这里取真实的 id（`server-reference-manifest.json`），
+ * 保证请求确实能走到 action 分发。
+ *
+ * ── 为什么要在两处找，并且先"预热" ──
+ *
+ * 实测：
+ * - `next start`（生产构建）把清单写在 `.next/server/...`；
+ * - `next dev` 写在 `.next/dev/server/...`，且**懒编译** ——
+ *   不先访问一次 `/settings`，清单根本不存在。
+ *
+ * 因此 dev 模式必须先把这个路径请求一次，再读清单；否则会得到
+ * "没有 action id"，进而让整组写入矩阵被跳过 —— 那是"看起来通过"。
+ */
+async function readSettingsActionIds(port: number, mode: "start" | "dev"): Promise<string[]> {
+  /*
+   * ── 路径必须按模式选，不能"两个都试，先命中先用" ──
+   *
+   * 实测踩到：`next dev` 与生产构建会同时存在于同一个 `.next/` 下
+   * （`.next/server/...` 是上次 build 的，`.next/dev/server/...` 是本 dev 进程的）。
+   * 若按"先生产后 dev"的顺序读，dev 实例会拿到**生产构建的 action id** ——
+   * 那对 dev 进程无效，于是每次调用都返回 409 "Server Action unavailable"，
+   * 找 action 的循环判定"没有 action 改变 profile"，整组矩阵被跳过。
+   *
+   * 那是一次**假绿**：矩阵没跑，却只报了一条"找不到 action"。
+   * 因此这里按模式只读对应那一份。
+   */
+  const primary =
+    mode === "dev"
+      ? join(process.cwd(), ".next", "dev", "server", "app", "settings", "page", "server-reference-manifest.json")
+      : join(process.cwd(), ".next", "server", "app", "settings", "page", "server-reference-manifest.json");
+
+  const read = (): string[] => {
+    if (!existsSync(primary)) return [];
+    try {
+      const manifest = JSON.parse(readFileSync(primary, "utf8")) as {
+        node?: Record<string, unknown>;
+      };
+      return Object.keys(manifest.node ?? {});
+    } catch {
+      return [];
+    }
+  };
+
+  let ids = read();
+  if (ids.length > 0) return ids;
+
+  /*
+   * 开发模式：请求该页面以触发懒编译，然后再读。
+   * 请求失败不视为致命 —— 交给调用方报"读不到 action id"。
+   */
+  try {
+    await rawGet(port, "/settings", `${LOOPBACK_HOST}:${port}`);
+  } catch {
+    /* 忽略：下面统一判空 */
+  }
+  for (let attempt = 0; attempt < 10 && ids.length === 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    ids = read();
+  }
+  return ids;
+}
+
+/** 读 profile 的可用分钟数（写入矩阵的前后对比基准）。 */
+async function readProfileMinutes(): Promise<{ weekday: number; weekend: number } | null> {
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(E2E_LOOPBACK_PROOF_DB_PATH, { readOnly: true });
+  try {
+    const row = db
+      .prepare("SELECT weekday_minutes, weekend_minutes FROM learner_profile LIMIT 1")
+      .get() as { weekday_minutes: number; weekend_minutes: number } | undefined;
+    if (!row) return null;
+    return { weekday: row.weekday_minutes, weekend: row.weekend_minutes };
+  } catch {
+    return null;
+  } finally {
+    db.close();
+  }
+}
+
+/** 复位 profile 的分钟数，保证每个用例从同一基准出发。 */
+async function resetProfileMinutes(): Promise<void> {
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(E2E_LOOPBACK_PROOF_DB_PATH);
+  try {
+    db.prepare("UPDATE learner_profile SET weekday_minutes = 60, weekend_minutes = 120").run();
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Server Action 写入矩阵（缺陷 A / B 的运行时回归）。
+ *
+ * ── 判据是"数据库有没有变"，不是"状态码是多少" ──
+ *
+ * 这正是本轮两个缺陷的教训：状态码 200 且**库被改**才是缺口；
+ * 而 403 但库仍被改同样是缺口。因此每个用例都对比前后两行。
+ *
+ * ── 为什么每个用例都复位 ──
+ *
+ * 否则 A 用例写入的 137/211 会让后续"拒绝"用例的"库未变"断言
+ * 变成同义反复（本来就是 137，变了也看不出来）。复位保证每次对比有效。
+ */
+async function verifyActionWriteMatrix(label: string, port: number, mode: "start" | "dev"): Promise<void> {
+  const actionIds = await readSettingsActionIds(port, mode);
+  if (actionIds.length === 0) {
+    check(`${label}：能读到真实 Server Action ID`, false, "server-reference-manifest.json 缺失");
+    return;
+  }
+  check(`${label}：能读到真实 Server Action ID`, true);
+
+  /*
+   * 逐个 action id 试一次，找出真正接受 { weekdayMinutes, weekendMinutes }
+   * 的那一个 —— 不硬编码 id（它会随构建变化）。
+   *
+   * ── 基准必须是**复位之后**的那一行 ──
+   *
+   * 这里踩过一次：若在循环前读 `baseline`，而它恰好已经是 137/211
+   * （上一轮遗留），那么"写成功"也会被判成"没变化"，于是找不到 action、
+   * 整组矩阵被跳过 —— 一个因为测试自身缺陷而"看起来通过"的假绿。
+   * 因此每一轮都在复位后重新读基准。
+   */
+  let preferenceActionId: string | null = null;
+
+  for (const id of actionIds) {
+    await resetProfileMinutes();
+    const before = await readProfileMinutes();
+    if (before === null) {
+      check(`${label}：profile 行存在（写入矩阵的前提）`, false);
+      return;
+    }
+    await rawActionWrite(port, `${LOOPBACK_HOST}:${port}`, `http://${LOOPBACK_HOST}:${port}`, id);
+    const after = await readProfileMinutes();
+    const changed =
+      after !== null && (after.weekday !== before.weekday || after.weekend !== before.weekend);
+    if (changed) {
+      preferenceActionId = id;
+      break;
+    }
+  }
+
+  if (preferenceActionId === null) {
+    check(`${label}：找到一个会真正写库的 Server Action`, false, "没有 action 改变了 profile");
+    return;
+  }
+  check(`${label}：找到一个会真正写库的 Server Action`, true);
+
+  /* ── 每个用例：复位 → 读前 → 发请求 → 读后 ── */
+  const cases: Array<{
+    name: string;
+    host: string;
+    origin: string | null;
+    expectStatus: number;
+    expectDbChange: boolean;
+  }> = [
+    // A. 规范 Host + 规范 Origin ⇒ 必须成功且真的写库
+    { name: "A 规范 Host + 规范 Origin", host: `${LOOPBACK_HOST}:${port}`, origin: `http://${LOOPBACK_HOST}:${port}`, expectStatus: 200, expectDbChange: true },
+    // B. 别名 Host + 别名 Origin ⇒ 拒绝
+    { name: "B localhost Host + localhost Origin", host: `localhost:${port}`, origin: `http://localhost:${port}`, expectStatus: 403, expectDbChange: false },
+    // C. 规范主机名 + 伪造端口（缺陷 A 的原始形态）
+    { name: "C 规范主机名 + 伪造端口 9999", host: `${LOOPBACK_HOST}:9999`, origin: `http://${LOOPBACK_HOST}:9999`, expectStatus: 403, expectDbChange: false },
+    // D. 规范 Host + 缺失 Origin（缺陷 B 的原始形态）
+    { name: "D 规范 Host + 缺失 Origin", host: `${LOOPBACK_HOST}:${port}`, origin: null, expectStatus: 403, expectDbChange: false },
+    // E. 规范 Host + null Origin
+    { name: "E 规范 Host + null Origin", host: `${LOOPBACK_HOST}:${port}`, origin: "null", expectStatus: 403, expectDbChange: false },
+    // F. 规范 Host + 跨端口 Origin
+    { name: "F 规范 Host + 跨端口 Origin", host: `${LOOPBACK_HOST}:${port}`, origin: `http://${LOOPBACK_HOST}:${port + 1}`, expectStatus: 403, expectDbChange: false },
+    // G. 规范 Host + 外部 Origin
+    { name: "G 规范 Host + 外部 Origin", host: `${LOOPBACK_HOST}:${port}`, origin: "https://evil.example", expectStatus: 403, expectDbChange: false },
+    // H. 非规范 Host + 缺失 Origin
+    { name: "H 非规范 Host + 缺失 Origin", host: `localhost:${port}`, origin: null, expectStatus: 403, expectDbChange: false },
+  ];
+
+  for (const testCase of cases) {
+    await resetProfileMinutes();
+    const before = await readProfileMinutes();
+    const response = await rawActionWrite(port, testCase.host, testCase.origin, preferenceActionId);
+    const after = await readProfileMinutes();
+    const changed =
+      before !== null && after !== null && (before.weekday !== after.weekday || before.weekend !== after.weekend);
+
+    check(
+      `${label} · ${testCase.name} ⇒ ${testCase.expectStatus}`,
+      response.status === testCase.expectStatus,
+      `状态 ${response.status}`,
+    );
+    check(
+      `${label} · ${testCase.name} ⇒ 数据库${testCase.expectDbChange ? "已更新" : "不变"}`,
+      changed === testCase.expectDbChange,
+      `前 ${before?.weekday}/${before?.weekend} → 后 ${after?.weekday}/${after?.weekend}`,
+    );
+  }
+}
+
+/** 发一个**真实 Server Action** 写请求（带真实 action id 与任意 Host/Origin）。 */
+function rawActionWrite(
+  port: number,
+  hostHeader: string,
+  originHeader: string | null,
+  actionId: string,
+): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const payload = Buffer.from(
+      JSON.stringify([{ weekdayMinutes: 137, weekendMinutes: 211 }]),
+      "utf8",
+    );
+    const headers: Record<string, string> = {
+      host: hostHeader,
+      "next-action": actionId,
+      "content-type": "text/plain;charset=UTF-8",
+      "content-length": String(payload.byteLength),
+    };
+    if (originHeader !== null) headers.origin = originHeader;
+
+    const req = httpRequest(
+      { host: LOOPBACK_HOST, port, path: "/settings", method: "POST", headers, timeout: 25000 },
+      (res) => {
+        let body = "";
+        res.on("data", (chunk: Buffer) => {
+          body += chunk.toString("utf8");
+        });
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+      },
+    );
+    req.on("timeout", () => {
+      req.destroy();
+      resolve({ status: 0, body: "timeout" });
+    });
+    req.on("error", reject);
+    req.write(payload);
+    req.end();
+  });
+}
+
 async function main(): Promise<void> {
   console.log("本地回环绑定与同源一致性 · 运行时证明（真实 next dev / next start，合成数据）\n");
 
@@ -639,6 +884,7 @@ async function main(): Promise<void> {
   }
   check("合成实例（start）成功启动", true);
   await verifyInstance("pnpm start", startPort, probe);
+  await verifyActionWriteMatrix("pnpm start", startPort, "start");
   await stopServer(startChild, startPort);
 
   // ── 开发：`pnpm dev` ──
@@ -650,6 +896,7 @@ async function main(): Promise<void> {
   }
   check("合成实例（dev）成功启动", true);
   await verifyInstance("pnpm dev", devPort, probe);
+  await verifyActionWriteMatrix("pnpm dev", devPort, "dev");
   await stopServer(devChild, devPort);
 
   console.log(`\n结果：${passed} 通过 / ${failed} 失败`);
