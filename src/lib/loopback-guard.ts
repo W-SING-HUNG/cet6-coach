@@ -99,33 +99,60 @@ export function trustedHostname(): string {
 }
 
 /**
- * 可信来源的**权威 authority**（主机名 + 生效端口），用于 Host 头精确比对。
+ * 协议 → 默认端口（WHATWG URL 规范里"可省略"的那些端口）。
  *
- * ── 为什么需要它，而不是直接比字符串 ──
+ * ── 为什么需要这张表 ──
  *
- * `Host` 头的规范形态对"默认端口"有省略规则：端口 80 的
- * `http://127.0.0.1:80` 与 `http://127.0.0.1` 是同一个来源，浏览器可能只发
- * 其中一种形态。若用字符串相等判定，会把合法请求判错。
+ * `URL#port` 会把默认端口**规范化为空串**：`new URL("http://h:80").port === ""`。
+ * 因此可信来源侧拿到的是 `""`，而请求侧 `Host: h:80` 解析出的是 `"80"`。
+ * 直接比字符串就会把同一个来源判成不同来源 —— 独立审查在真实 80 实例上
+ * 实测到合法请求被拒（403）。
  *
- * 因此这里把**可信来源**归一化成 `主机名:端口` 的形式（端口取
- * `URL#port`，其已按协议把默认端口归一化为空串），再把请求侧按同一规则
- * 归一化后比较 —— 两边都经过同一套规则，才谈得上"精确相等"。
+ * 反方向同样危险：`Host: h`（无端口）在 http 下等价于 80。若不做等效
+ * 规范化，就会把"省略默认端口"当成"任意端口"而放行非默认端口的请求。
  *
- * 注意方向：归一化的**基准来自配置**（`configuredLocalOrigin()`），
- * 请求头只被拿来比较，永远不会参与定义可信来源。
+ * 因此两侧都必须归一到**生效端口**再比较，而默认端口的依据是
+ * **可信来源的协议**（来自配置），不是请求头。
  */
-function trustedAuthority(): { hostname: string; port: string } {
+const DEFAULT_PORTS: Readonly<Record<string, string>> = {
+  "http:": "80",
+  "https:": "443",
+};
+
+/**
+ * 可信来源的**权威 authority**（主机名 + **生效**端口），用于 Host 头精确比对。
+ *
+ * ── 关键：`port` 是"生效端口"，不是 `URL#port` ──
+ *
+ * 上一版直接返回 `url.port`，于是 http 默认端口得到 `""`。请求侧显式写
+ * `:80` 时得到 `"80"`，两者不等 ⇒ **合法请求被拒**。
+ *
+ * 现在：配置显式给了端口就用它；没给就按协议取默认端口（80 / 443）。
+ * 这样 `""`（省略）与 `"80"`（显式）都归到同一个 `"80"`。
+ *
+ * 方向仍然不变：归一化的**基准来自配置**（`configuredLocalOrigin()`），
+ * 请求头只被拿来比较，永远不参与定义可信来源。
+ */
+function trustedAuthority(): { hostname: string; port: string; protocol: string } {
   const url = new URL(configuredLocalOrigin());
   return {
     // IPv6 字面量在 `URL#hostname` 里带方括号，与 Host 头形态一致。
     hostname: url.hostname,
-    // 默认端口（http:80 / https:443）被 `URL` 归一化为空串。
-    port: url.port,
+    // 显式端口优先；否则取该协议的默认端口（`URL` 已把默认端口归一化为空串）。
+    port: url.port !== "" ? url.port : (DEFAULT_PORTS[url.protocol] ?? ""),
+    protocol: url.protocol,
   };
 }
 
+
 /**
  * 把 `Host` 头解析成 `{ hostname, port }`，解析失败返回 `null`。
+ *
+ * ── `port` 是**原样**的端口串，不是生效端口 ──
+ *
+ * 本函数只做**语法解析**：`""` 表示"Host 里没有端口"，`"80"` 表示显式写了 80。
+ * 两者的等效关系由 `isTrustedHostHeader` 结合**可信协议**去判 —— 因为
+ * "省略端口等于 80"这条规则的依据是协议，而协议来自配置，不来自 Host。
  *
  * ── 逐类畸形输入的处理 ──
  *
@@ -138,6 +165,7 @@ function trustedAuthority(): { hostname: string; port: string } {
  * | `evil.example` | hostname 不匹配，由调用方拒绝 |
  * | `a:b:3100` | `null`（裸 IPv6 缺方括号 ⇒ 畸形） |
  * | `127.0.0.1:abc` | `null`（端口非数字 ⇒ 畸形） |
+ * | `127.0.0.1:` | `null`（**尾随冒号无端口数字** ⇒ 畸形） |
  * | `127.0.0.1:99999` | `null`（端口越界 ⇒ 畸形） |
  * | `""` / `undefined` | `null` |
  */
@@ -179,8 +207,20 @@ export function parseHostHeader(
 
   if (hostname === "") return null;
 
-  const port = rest === "" ? "" : rest.slice(1);
-  if (port !== "") {
+  /*
+   * ── 尾随冒号（`host:`）必须拒绝，不能当成"无端口" ──
+   *
+   * 上一版把 `"127.0.0.1:"` 解析成 `port: ""`，于是它与"无端口"完全等价，
+   * 在默认端口的配置下会被**放行**。那是一条真实的不严格输入：
+   * `Host:` 后什么都没有，不同解析器对它的解释并不一致，安全边界只能取
+   * "拒绝"这一侧。因此这里要求：有冒号就必须有非空端口串。
+   */
+  const hasPortSyntax = rest !== "";
+  const port = hasPortSyntax ? rest.slice(1) : "";
+
+  if (hasPortSyntax) {
+    // 冒号之后必须是非空数字串（否则就是尾随冒号/空端口）。
+    if (port === "") return null;
     // 端口必须是纯数字且落在 1–65535。
     if (!/^\d{1,5}$/.test(port)) return null;
     const numeric = Number(port);
@@ -193,27 +233,48 @@ export function parseHostHeader(
 /**
  * 判定 Host 头是否属于**本应用自己**。
  *
- * ── 它守的那个实测缺陷（本轮）──
+ * ── 它守的那两个实测缺陷 ──
  *
- * 上一版只比 `hostname`，**完全忽略端口**。独立审查用真实的 Server Action
- * ID 与合成 SQLite 库实测：
+ * **其一（上一轮）**：上一版只比 `hostname`，**完全忽略端口**。独立审查用
+ * 真实 Server Action ID 与合成 SQLite 实测：
  *
  *   `Host: 127.0.0.1:9999` + `Origin: http://127.0.0.1:9999`
  *   ⇒ HTTP 200，且数据库被真的改动。
  *
- * 原因有两层：本函数放过了错误端口；而 Next 内置的 action CSRF 门禁
- * 只把 `Origin` 与 `Host` 相比 —— 两者都由客户端给，自然相等。
- * 因此"精确到端口"必须由**本项目**判定，不能外包给框架。
+ * 因此"精确到端口"必须由**本项目**判定，不能外包给框架的 Host/Origin 比较。
  *
- * 现在要求 `hostname` 与 `port` **同时**等于可信来源（见 `trustedAuthority`）。
- * 缺失端口只有在可信来源**本身**没有端口（即 80/443 默认端口）时才等价；
- * 否则视为不同来源。
+ * **其二（本轮）**：只比端口字符串又走向另一个极端 —— `trustedAuthority().port`
+ * 来自 `URL#port`，而它把默认端口规范化为 `""`；请求侧 `Host: h:80` 却解析出
+ * `"80"`。两者不等 ⇒ **合法请求被拒**（独立审查在真实 80 实例上复现）。
+ *
+ * ── 现在的判据：按**生效端口**比较 ──
+ *
+ * 两侧都归一化成"实际监听的端口"：
+ *
+ * - 可信侧：配置显式给了端口就用它，否则取该协议的默认端口（80 / 443）；
+ * - 请求侧：显式给了端口就用它，否则取**可信协议的**默认端口。
+ *
+ * 于是 `h` 与 `h:80` 在 http 配置下都被判为同一来源（正确），
+ * 而非默认端口必须显式精确匹配（`h:3100` 不能用一个裸 `h` 蒙混过关）。
+ *
+ * ── 方向不变 ──
+ *
+ * "省略端口等于多少"这条规则的依据是**可信协议的默认端口**，来自配置；
+ * 请求头只被拿来比较，永远不参与定义可信来源。
  */
 export function isTrustedHostHeader(hostHeader: string | undefined): boolean {
   const parsed = parseHostHeader(hostHeader);
   if (parsed === null) return false;
   const trusted = trustedAuthority();
-  return parsed.hostname === trusted.hostname && parsed.port === trusted.port;
+  if (parsed.hostname !== trusted.hostname) return false;
+
+  /*
+   * 请求侧省略端口时，按**可信协议的**默认端口补齐，再与可信侧比较。
+   * `trusted.port` 已经是生效端口（配置值或协议默认值），因此这里是一次
+   * 纯字符串等价判定 —— 两侧的"生效端口"都已确定。
+   */
+  const requestPort = parsed.port !== "" ? parsed.port : (DEFAULT_PORTS[trusted.protocol] ?? "");
+  return requestPort === trusted.port;
 }
 
 /** Host 头是否至少是回环（宽松判据，仅用于诊断与测试对照）。 */

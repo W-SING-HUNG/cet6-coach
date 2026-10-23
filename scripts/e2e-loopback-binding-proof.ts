@@ -22,7 +22,7 @@
  * 它**不碰** `private-content/`，也不碰日常开发库，更**不运行** `e2e:real`。
  */
 
-import { createConnection } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { request as httpRequest } from "node:http";
 import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
@@ -38,6 +38,8 @@ import { telemetryOffEnv } from "./next.mjs";
 
 let passed = 0;
 let failed = 0;
+/** 跳过数：仅在环境确实做不到时使用（例如无法绑定特权的默认端口）。 */
+let skipped = 0;
 
 function check(label: string, condition: boolean, detail = ""): void {
   if (condition) {
@@ -899,11 +901,137 @@ async function main(): Promise<void> {
   await verifyActionWriteMatrix("pnpm dev", devPort, "dev");
   await stopServer(devChild, devPort);
 
-  console.log(`\n结果：${passed} 通过 / ${failed} 失败`);
+  await verifyDefaultPortAuthority();
+
+  console.log(`\n结果：${passed} 通过 / ${skipped} 跳过 / ${failed} 失败`);
   if (failed > 0) process.exitCode = 1;
 
   // 硬超时兜底：绝不挂住（CI 上一次挂住会浪费整轮预算）。
   setTimeout(() => process.exit(process.exitCode ?? 0), 3000).unref();
+}
+
+/**
+ * 默认端口（HTTP 80）下的 authority 规范化 · 真实进程验证。
+ *
+ * ── 它守的那个实测缺陷（本轮）──
+ *
+ * `trustedAuthority()` 曾直接返回 `URL#port`，而 WHATWG URL 把默认端口规范化
+ * 为 `""`；请求侧 `Host: h:80` 解析成 `"80"`，两者不等 ⇒ **合法请求被拒**。
+ * 独立审查在真实 80 实例上复现。
+ *
+ * ── 为什么这一段**可能跳过**，而跳过要说清楚 ──
+ *
+ * 绑定 1024 以下的端口在多数 CI runner 上需要特权；拿不到时**不能**
+ * 悄悄当作通过（那正是本仓库反复警告的假绿）。因此这里：
+ * - 端口能绑 ⇒ 真实起一个 80 实例并跑完整判据；
+ * - 端口绑不了 ⇒ 记为 **SKIP** 并写明原因，不计入通过数。
+ *
+ * 判据本身的纯函数版本（22 项）在 `tests/default-port-authority.test.ts` 里，
+ * 那个在任何环境都会执行 —— 所以"跳过"不等于"没验证"。
+ */
+async function verifyDefaultPortAuthority(): Promise<void> {
+  const DEFAULT_PORT = 80;
+  console.log(`\n── 默认端口 authority（HTTP ${DEFAULT_PORT}）──`);
+
+  // 先确认这个端口当前可用；不可用就明确跳过。
+  const canBind = await canBindPort(DEFAULT_PORT);
+  if (!canBind) {
+    skipped += 1;
+    console.log(
+      `  ○ 跳过：无法绑定 ${DEFAULT_PORT} 端口（通常需要特权）。` +
+        `判据的纯函数覆盖见 tests/default-port-authority.test.ts。`,
+    );
+    return;
+  }
+
+  /*
+   * 用**不带显式端口**的可信来源配置启动：`http://127.0.0.1`。
+   * 这正是独立审查复现缺陷时的那种配置。
+   */
+  const child = spawn(
+    process.execPath,
+    ["scripts/next.mjs", "start", "-H", LOOPBACK_HOST, "-p", String(DEFAULT_PORT)],
+    {
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        ...telemetryOffEnv(),
+        CET6_DB_PATH: E2E_LOOPBACK_PROOF_DB_PATH,
+        // 一个"默认端口"形态的配置：不写 :80。
+        CET6_LOCAL_ORIGIN: `http://${LOOPBACK_HOST}`,
+      },
+    },
+  );
+
+  try {
+    if (!(await waitForPort(DEFAULT_PORT))) {
+      check(`默认端口实例（:${DEFAULT_PORT}）成功启动`, false, "90 秒内未就绪");
+      return;
+    }
+    check(`默认端口实例（:${DEFAULT_PORT}）成功启动`, true);
+
+    /* ① 无端口 Host 合法（这是省略默认端口的规范写法）。 */
+    const noPort = await rawGet(DEFAULT_PORT, "/practice/courses", LOOPBACK_HOST);
+    check(
+      `默认端口：无端口 Host 被放行`,
+      noPort.status === 200,
+      `状态 ${noPort.status}`,
+    );
+
+    /* ② 显式 :80 合法（本轮修复的核心 —— 旧版这里会 421/403）。 */
+    const explicit80 = await rawGet(
+      DEFAULT_PORT,
+      "/practice/courses",
+      `${LOOPBACK_HOST}:${DEFAULT_PORT}`,
+    );
+    check(
+      `默认端口：显式 :${DEFAULT_PORT} Host 与省略端口等效`,
+      explicit80.status === 200,
+      `状态 ${explicit80.status}（旧版缺陷会在此处拒绝合法请求）`,
+    );
+
+    /* ③ 尾随冒号必须拒绝（不得被当成"无端口"放行）。 */
+    const trailing = await rawGet(DEFAULT_PORT, "/practice/courses", `${LOOPBACK_HOST}:`);
+    check(
+      `默认端口：尾随冒号 Host 被拒绝`,
+      trailing.status === 421,
+      `状态 ${trailing.status}`,
+    );
+
+    /* ④ 非默认端口仍被拒（80 的配置下 :3100 是另一个来源）。 */
+    const otherPort = await rawGet(DEFAULT_PORT, "/practice/courses", `${LOOPBACK_HOST}:3100`);
+    check(
+      `默认端口：非默认端口 Host 被拒绝`,
+      otherPort.status === 421,
+      `状态 ${otherPort.status}`,
+    );
+
+    /* ⑤ 写请求：无 Origin 仍必须 403（默认端口不放松 Origin 必填）。 */
+    const noOrigin = await rawPost(DEFAULT_PORT, "/settings", {
+      hostHeader: LOOPBACK_HOST,
+      body: "[]",
+      extraHeaders: { "next-action": "0".repeat(40), "content-type": "text/plain;charset=UTF-8" },
+    });
+    check(
+      `默认端口：缺失 Origin 的写请求仍 403`,
+      noOrigin.status === 403,
+      `状态 ${noOrigin.status}`,
+    );
+  } finally {
+    await stopServer(child, DEFAULT_PORT);
+  }
+}
+
+/** 试探某个端口当前能否绑定（不能绑定 ⇒ 调用方按 SKIP 处理，不算通过）。 */
+function canBindPort(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = createServer();
+    probe.once("error", () => resolve(false));
+    probe.once("listening", () => {
+      probe.close(() => resolve(true));
+    });
+    probe.listen(port, LOOPBACK_HOST);
+  });
 }
 
 main().catch((error: unknown) => {
