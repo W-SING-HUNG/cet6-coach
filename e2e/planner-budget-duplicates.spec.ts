@@ -97,6 +97,17 @@ test.describe("重复逾期别名 · 当天预算不得被压空", () => {
       `可用 ${available} 分钟、库里有可训练真题，计划占用却是 ${planned} 分钟 —— ` +
         `${E2E_DUPLICATE_ALIAS_COUNT} 条重复别名把当天预算压空了`,
     ).toBeGreaterThan(0);
+
+    /*
+     * 页面本身不得带着运行时错误把这个状态"演"出来。
+     *
+     * 收集器本来就挂上了（`attachErrorCollectors`），但此前没有任何断言
+     * 消费它 —— 与仓库里其余 spec 的写法不一致，而且意味着"页面报了错
+     * 但预算数字偶然正确"这种情况会被判为通过。这里补上断言，而不是
+     * 删掉收集器：要守的是"没有错误"，不是"没有收集器"。
+     */
+    expect(pageErrors, `pageerror：\n${pageErrors.join("\n")}`).toHaveLength(0);
+    expect(consoleErrors, `console error：\n${consoleErrors.join("\n")}`).toHaveLength(0);
   });
 
   test("重复别名在清单里**可见**（不得靠删除历史条目让数字好看）", async ({ page }) => {

@@ -27,7 +27,7 @@ These ship in the application bundle or run on the server.
 
 | Package | Version | Licence | Project |
 | --- | --- | --- | --- |
-| `next` | 16.3.6 | MIT | <https://nextjs.org> |
+| `next` | 16.4.2 | MIT | <https://nextjs.org> |
 | `react` | 19.2.8 | MIT | <https://react.dev> |
 | `react-dom` | 19.2.8 | MIT | <https://react.dev> |
 | `zod` | 4.6.5 | MIT | <https://zod.dev> |
@@ -46,8 +46,8 @@ application runtime.
 | --- | --- | --- |
 | `typescript` | 5.9.3 | Apache-2.0 |
 | `eslint` | 9.39.5 | MIT |
-| `eslint-config-next` | 16.3.6 | MIT |
-| `vitest` | 5.0.1 | MIT |
+| `eslint-config-next` | 16.4.2 | MIT |
+| `vitest` | 5.0.5 | MIT |
 | `jsdom` | 30.1.1 | MIT |
 | `@playwright/test` | 1.63.0 | Apache-2.0 |
 | `@testing-library/react` | 16.3.3 | MIT |
@@ -67,13 +67,13 @@ package's `LICENSE` file inside `node_modules/pdfjs-dist/`.
 
 ## Transitive dependency licences
 
-The lockfile resolves 422 distinct packages. Grouped by declared licence:
+The lockfile resolves 420 distinct packages. Grouped by declared licence:
 
 | Licence | Count | Example packages |
 | --- | --- | --- |
-| MIT | 357 | `@babel/*`, `chai`, `jsdom`, `vite`, `vitest`, `zod`, `vite`'s `rolldown` |
+| MIT | 356 | `@babel/*`, `chai`, `jsdom`, `vite`, `vitest`, `zod`, `vite`'s `rolldown` |
 | Apache-2.0 | 26 | `typescript`, `@playwright/test`, `pdfjs-dist`, `@swc/helpers`, `sharp`, `class-variance-authority` |
-| ISC | 16 | `lucide-react`, `semver`, `minimatch`, `graceful-fs` |
+| ISC | 14 | `lucide-react`, `semver`, `minimatch`, `graceful-fs` |
 | BSD-2-Clause | 9 | `entities`, `espree`, `estraverse`, `uri-js` |
 | MPL-2.0 | 3 | `axe-core`, `lightningcss`, `lightningcss-win32-x64-msvc` |
 | BSD-3-Clause | 3 | `esquery`, `source-map-js`, `tough-cookie` |
@@ -82,6 +82,7 @@ The lockfile resolves 422 distinct packages. Grouped by declared licence:
 | 0BSD | 1 | `tslib` |
 | Python-2.0 | 1 | `argparse` |
 | CC-BY-4.0 | 1 | `caniuse-lite` |
+| BlueOak-1.0.0 | 1 | `lru-cache` |
 | Apache-2.0 AND LGPL-3.0-or-later | 1 | `@img/sharp-win32-x64` |
 
 Every dependency's full licence text is present in its own directory under
@@ -111,6 +112,12 @@ Every dependency's full licence text is present in its own directory under
   - it is present in the pnpm store because the package manager resolves
     optional dependencies for every platform, but it is not linked into the
     top-level `node_modules` and is not reachable from application code.
+  - the resolved `sharp` version is **0.35.5**, which is the version that
+    carries the librsvg fix for CVE-2026-96889. The version is not chosen here:
+    `next@16.4.2` declares `sharp: ^0.35.5` as an optional dependency, so the
+    upgrade follows from the Next.js security update rather than from a
+    separate decision. The resolved value is recorded in `pnpm-lock.yaml` and
+    is checked by `pnpm audit`.
 - **`Python-2.0`** (`argparse`) is an MIT-compatible permissive licence and is
   used only through a build tool.
 

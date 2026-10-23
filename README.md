@@ -90,7 +90,26 @@ pnpm dev
 ```
 
 The development server is pinned to **port 3100** (port 3000 is often taken by
-other local projects), so open <http://localhost:3100>.
+other local projects) and binds **loopback only**, so open
+<http://127.0.0.1:3100>.
+
+> **Use `127.0.0.1`, not `localhost`.** Both names reach the same server, but a
+> browser treats them as two different origins, and only one origin can be the
+> trusted one. That origin is `127.0.0.1`.
+>
+> What happens if you open the other name:
+>
+> - **Page loads are not redirected.** You get a short page explaining the
+>   situation, with a link to the same page on the canonical address. The link
+>   uses the address this instance is actually configured to serve (so a
+>   development instance and an E2E instance each point at themselves), and it
+>   carries only the path and query — never the port from your `Host` header.
+> - **Saving actions are refused.** Nothing is forwarded, and nothing is
+>   written. Click the link, then repeat the action on the canonical address.
+>
+> This is deliberate. Accepting both names would mean accepting two origins for
+> the same set of writes, including the one request that releases private study
+> content.
 
 On first load, `/` redirects through `/onboarding` → `/diagnostic` → `/today`.
 
@@ -98,7 +117,7 @@ For a production build:
 
 ```bash
 pnpm build
-pnpm start          # http://localhost:3100
+pnpm start          # http://127.0.0.1:3100
 ```
 
 ### First run in a clean checkout

@@ -19,8 +19,12 @@ project. A few things will save us both time.
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm dev                 # http://localhost:3100
+pnpm dev                 # http://127.0.0.1:3100
 ```
+
+Open `127.0.0.1`, not `localhost`: the two are different browser origins and
+only the canonical one is accepted for state-changing requests. See the README
+section "Install and run" for why.
 
 Requirements are in the [README](README.md#requirements). Node >= 24 is not
 optional: the data layer uses the built-in `node:sqlite`.
