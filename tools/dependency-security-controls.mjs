@@ -286,7 +286,21 @@ withTempDir("depsec-empty-", (path) => {
 
 // ── control 3: an unreachable advisory index is an ERROR ──
 {
-  const { status, out } = runGate(ROOT, [], offlineEnv());
+  /*
+   * ── Why this control runs the gate with a shortened timeout ──
+   *
+   * The assertion is about the *verdict*, not about how long the failure takes:
+   * an unreachable advisory index must report ERROR and must never report PASS.
+   * Behind an unreachable proxy, however, `pnpm audit` waits rather than failing
+   * fast (measured: still running at 25 s), so at the production timeout this one
+   * control alone would add ~90 s to every CI run.
+   *
+   * `CET6_AUDIT_TIMEOUT_MS` lets the control shorten that. The gate only accepts
+   * values between 1 s and the production ceiling, so the knob cannot be used to
+   * mask a slow endpoint in a real run — it can only make the check give up
+   * sooner.
+   */
+  const { status, out } = runGate(ROOT, [], { ...offlineEnv(), CET6_AUDIT_TIMEOUT_MS: "2000" });
   const verdict = printedVerdict(out);
   check(
     "gate reports ERROR when the advisory index is unreachable",
@@ -299,9 +313,28 @@ withTempDir("depsec-empty-", (path) => {
     out.slice(-300),
   );
 }
+// ── control: the test-only timeout override cannot be used to widen the ceiling ──
+/*
+ * The override exists so the unreachable-index control above does not add 90 s to
+ * every run. That makes it a knob in a security gate, so its bounds are asserted:
+ * it can shorten the wait, never lengthen it, and a value outside the range is
+ * ignored rather than honoured.
+ */
+{
+  const gateSource = readFileSync(GATE, "utf8");
+  check(
+    "the timeout override is clamped to the production ceiling",
+    /override\s*<=\s*45_000/.test(gateSource),
+    "an unbounded override could mask a hanging advisory endpoint",
+  );
+  check(
+    "the timeout override has a floor",
+    /override\s*>=\s*1_?000/.test(gateSource),
+    "an override of a few milliseconds would fail the scan for the wrong reason",
+  );
+}
 
-console.log("");
-if (failures > 0) {
+console.log("");if (failures > 0) {
   console.error(`dependency security controls: ${failures} FAILED`);
   process.exit(1);
 }

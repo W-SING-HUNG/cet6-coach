@@ -246,8 +246,18 @@ function attemptAudit(command, prefixArgs) {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       maxBuffer: 64 * 1024 * 1024,
-      // A hung endpoint must not hang CI.
-      timeout: 120_000,
+      /*
+       * A hung advisory endpoint must not hang CI.
+       *
+       * Measured: behind an unreachable proxy `pnpm audit` does not fail fast, it
+       * waits. At 120 s per attempt with two attempts, one unreachable endpoint
+       * would hold a runner for four minutes — and in the scheduled workflow,
+       * which has no other work to do, that is the entire run. 45 s is far longer
+       * than a healthy advisory index needs (a full scan of this tree takes ~2 s)
+       * and short enough that two attempts plus overhead stay inside the 10-minute
+       * job timeout with room for the install.
+       */
+      timeout: AUDIT_TIMEOUT_MS,
     });
     return { stdout, stderr: "", status: 0, spawnFailure: null };
   } catch (error) {
@@ -267,12 +277,41 @@ function attemptAudit(command, prefixArgs) {
  * failure should neither be reported as a vulnerability nor accepted as safety.
  * A persistent failure stays an ERROR.
  */
+/**
+ * Per-attempt timeout for `pnpm audit`.
+ *
+ * 45 s is far longer than a healthy advisory index needs (a full scan of this tree
+ * takes about 2 s) and short enough that two attempts plus overhead stay well inside
+ * the scheduled workflow's 10-minute job timeout.
+ *
+ * Overridable by environment **for the negative controls only**. The
+ * unreachable-endpoint control has to observe a real transport failure, and behind
+ * an unreachable proxy `pnpm audit` waits rather than failing fast — measured at
+ * >25 s. Without an override that single control would add ~90 s to every CI run.
+ * The override can only make the timeout *shorter*, never longer, so it cannot be
+ * used to mask a slow endpoint in a real run.
+ */
+const AUDIT_TIMEOUT_MS = (() => {
+  const override = Number(process.env.CET6_AUDIT_TIMEOUT_MS ?? "");
+  if (Number.isFinite(override) && override >= 1000 && override <= 45_000) return override;
+  return 45_000;
+})();
+
+/**
+ * Attempts per run.
+ *
+ * Two, so a single transient connection reset does not report a vulnerability and
+ * does not report safety either. The worst case is therefore 2 x 45 s; the controls
+ * exercise the unreachable path, so that bound is measured rather than assumed.
+ */
+const AUDIT_ATTEMPTS = 2;
+
 function runAudit() {
   const resolved = resolvePnpm();
   if (resolved === null) {
     return { stdout: "", stderr: "", status: null, spawnFailure: "not-on-path" };
   }
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
+  for (let attempt = 1; attempt <= AUDIT_ATTEMPTS; attempt += 1) {
     const result = attemptAudit(resolved.command, resolved.prefixArgs);
     if (result.spawnFailure !== null) {
       return { stdout: "", stderr: result.stderr, status: null, spawnFailure: result.spawnFailure };

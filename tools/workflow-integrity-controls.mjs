@@ -30,7 +30,7 @@
  * Usage: node tools/workflow-integrity-controls.mjs
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { withTempDir } from "./temp-workspace.mjs";
@@ -39,6 +39,7 @@ const ROOT = process.cwd();
 const GATE = join(ROOT, "tools", "check-workflow-integrity.mjs");
 const WORKFLOW_REL = join(".github", "workflows", "verify.yml");
 const DEPENDABOT_REL = join(".github", "dependabot.yml");
+const SCHEDULED_REL = join(".github", "workflows", "dependency-security.yml");
 
 let failures = 0;
 function check(label, condition, detail = "") {
@@ -52,6 +53,7 @@ function check(label, condition, detail = "") {
 
 const ORIGINAL = readFileSync(join(ROOT, WORKFLOW_REL), "utf8");
 const DEPENDABOT = readFileSync(join(ROOT, DEPENDABOT_REL), "utf8");
+const SCHEDULED = readFileSync(join(ROOT, SCHEDULED_REL), "utf8");
 
 /**
  * Build a throwaway tree containing what the gate reads, and run the gate inside it.
@@ -66,7 +68,8 @@ function gateOn(mutate) {
     mkdirSync(join(path, ".github", "workflows"), { recursive: true });
     writeFileSync(join(path, WORKFLOW_REL), ORIGINAL, "utf8");
     writeFileSync(join(path, DEPENDABOT_REL), DEPENDABOT, "utf8");
-    mutate(join(path, WORKFLOW_REL), join(path, DEPENDABOT_REL));
+    writeFileSync(join(path, SCHEDULED_REL), SCHEDULED, "utf8");
+    mutate(join(path, WORKFLOW_REL), join(path, DEPENDABOT_REL), join(path, SCHEDULED_REL));
 
     try {
       const stdout = execFileSync(process.execPath, [GATE], {
@@ -190,9 +193,120 @@ expectRefusal(
   },
   /no `ignore:` block/,
 );
+// ── control 12: the gate is unwired from CI ──
+/*
+ * The defect this control exists for actually happened in this project: the gate
+ * was written, reviewed and passing locally, while no workflow invoked it. It
+ * guarded nothing on a pull request until someone noticed.
+ *
+ * So the wiring is asserted, and this control proves the assertion can fail.
+ */
+expectRefusal(
+  "gate REFUSES a CI configuration that stops running the workflow integrity gate",
+  editWorkflow((text) => text.replace("        run: node tools/check-workflow-integrity.mjs", "        run: echo removed")),
+  /runs the workflow integrity gate/,
+);
 
-console.log("");
-if (failures > 0) {
+// ── control 13: the gate's own controls are unwired ──
+expectRefusal(
+  "gate REFUSES a CI configuration that stops running the integrity controls",
+  editWorkflow((text) => text.replace("        run: node tools/workflow-integrity-controls.mjs", "        run: echo removed")),
+  /runs the workflow integrity controls/,
+);
+
+// ── control 14: a pre-existing release gate deleted ──
+/*
+ * The publication job accumulated thirteen checks over several review rounds, and
+ * each one exists because something was once allowed through. Deleting any of
+ * them is the failure mode those rounds were about, so the gate asserts their
+ * presence and this control takes one away.
+ */
+expectRefusal(
+  "gate REFUSES removal of a pre-existing release gate (Git object audit)",
+  editWorkflow((text) =>
+    text.replace("      - name: Git object database audit\n        # Walks every object, including unreachable ones, and rejects a stored\n        # machine-account path, an internal record name or a non-neutral identity.\n        run: node tools/audit-object-database.mjs\n", ""),
+  ),
+  /still runs every pre-existing release gate/,
+);
+
+// ── control 15: the scheduled workflow deleted ──
+expectRefusal(
+  "gate REFUSES a missing scheduled dependency workflow",
+  (_workflowPath, _dependabotPath, scheduledPath) => rmSync(scheduledPath, { force: true }),
+  /scheduled dependency workflow exists/,
+);
+
+// ── control 16: the schedule itself removed ──
+expectRefusal(
+  "gate REFUSES a scheduled workflow with no cron trigger",
+  (_workflowPath, _dependabotPath, scheduledPath) => {
+    const text = readFileSync(scheduledPath, "utf8");
+    writeFileSync(scheduledPath, text.replace(/  schedule:\n(?:.*\n)*?  workflow_dispatch:/, "  workflow_dispatch:"), "utf8");
+  },
+  /cron schedule/,
+);
+
+// ── control 17: the manual trigger removed ──
+expectRefusal(
+  "gate REFUSES a scheduled workflow with no manual trigger",
+  (_workflowPath, _dependabotPath, scheduledPath) => {
+    const text = readFileSync(scheduledPath, "utf8");
+    writeFileSync(scheduledPath, text.replace("  workflow_dispatch:\n", ""), "utf8");
+  },
+  /manual dispatch/,
+);
+
+// ── control 18: the scheduled job escalates to a write scope ──
+expectRefusal(
+  "gate REFUSES a scheduled workflow with write permissions",
+  (_workflowPath, _dependabotPath, scheduledPath) => {
+    const text = readFileSync(scheduledPath, "utf8");
+    writeFileSync(scheduledPath, text.replace("  contents: read", "  contents: write"), "utf8");
+  },
+  /least privilege/,
+);
+
+// ── control 19: a second scanner implementation appears ──
+expectRefusal(
+  "gate REFUSES a scheduled workflow that stops calling the shared gate",
+  (_workflowPath, _dependabotPath, scheduledPath) => {
+    const text = readFileSync(scheduledPath, "utf8");
+    writeFileSync(scheduledPath, text.replace("run: node tools/check-dependency-security.mjs", "run: pnpm audit"), "utf8");
+  },
+  /same dependency gate/,
+);
+
+// ── control 20: the scheduled scan allowed to fail quietly ──
+expectRefusal(
+  "gate REFUSES a scheduled scan that suppresses its own failure",
+  (_workflowPath, _dependabotPath, scheduledPath) => {
+    const text = readFileSync(scheduledPath, "utf8");
+    writeFileSync(scheduledPath, text.replace("run: node tools/check-dependency-security.mjs", "run: node tools/check-dependency-security.mjs || true"), "utf8");
+  },
+  /does not suppress failures/,
+);
+
+// ── control 21: the daily run bloated into the full browser flow ──
+expectRefusal(
+  "gate REFUSES a scheduled run that also boots Chromium",
+  (_workflowPath, _dependabotPath, scheduledPath) => {
+    const text = readFileSync(scheduledPath, "utf8");
+    writeFileSync(scheduledPath, text.replace("      - name: Dependency security controls", "      - name: Playwright\n        run: pnpm exec playwright test\n\n      - name: Dependency security controls"), "utf8");
+  },
+  /does not retry Chromium|Chromium/,
+);
+
+// ── control 22: the scheduled workflow gains permission to open PRs ──
+expectRefusal(
+  "gate REFUSES a scheduled workflow that would open pull requests",
+  (_workflowPath, _dependabotPath, scheduledPath) => {
+    const text = readFileSync(scheduledPath, "utf8");
+    writeFileSync(scheduledPath, text.replace("      - name: Dependency security controls", "      - name: Open a fix\n        run: gh pr create --fill\n\n      - name: Dependency security controls"), "utf8");
+  },
+  /does not open or merge pull requests/,
+);
+
+console.log("");if (failures > 0) {
   console.error(`workflow integrity controls: ${failures} FAILED`);
   process.exit(1);
 }

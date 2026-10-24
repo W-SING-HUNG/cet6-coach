@@ -120,13 +120,42 @@ channel above. Do not paste the material into a public issue.
 
 ### What is checked automatically, and when
 
-Two mechanisms run on every push and every pull request, because each covers a
-gap the other cannot:
+Three mechanisms, because each covers a gap the others cannot:
 
 | Mechanism | Covers | Runs |
 | --- | --- | --- |
-| `tools/check-dependency-security.mjs` | advisories against the resolved versions in `pnpm-lock.yaml` | every push and PR (`quality` job) |
+| `tools/check-dependency-security.mjs` | advisories against the resolved versions in `pnpm-lock.yaml` | every push and PR (`quality` job of `verify.yml`) |
+| The same gate, on a schedule | the same advisories, when **nothing in the repository changed** | daily at 04:17 UTC, and on demand (`dependency-security.yml`) |
 | Dependabot (`.github/dependabot.yml`) | *new* versions of what is pinned, including the workflow actions | weekly, Monday 06:00 Asia/Shanghai |
+
+The second row is not redundant. A push-triggered scan only runs when a commit
+happens, so an advisory published against a version that is already pinned can sit
+unnoticed indefinitely. That is not hypothetical here: three `undici` advisories
+were published against the pinned version between two commits during this project,
+and the push-triggered gate would only have caught them at the next unrelated push.
+
+The scheduled workflow calls the **same** `tools/check-dependency-security.mjs`, so
+there is one definition of "is this tree vulnerable" rather than two that can
+disagree. It also runs the gate's controls, so a nightly green cannot come from a
+gate that was quietly weakened.
+
+| Scheduled check | Detail |
+| --- | --- |
+| Trigger | `schedule` (`17 4 * * *`, UTC) and `workflow_dispatch` |
+| Permissions | `contents: read` |
+| Secrets | none |
+| Scope | `pnpm install --frozen-lockfile`, the gate, the controls. No Chromium, no build, no publication gates |
+| On a finding | the run fails; it does not open, approve or merge a PR |
+
+**What the schedule cannot promise.** GitHub ignores `schedule` triggers on
+non-default branches, so this mechanism cannot be exercised from a pull request —
+its configuration is verified there, and its first real run can only be accepted
+after merge. Scheduled runs can also start late, and GitHub **disables scheduled
+workflows on inactive public repositories**, notifying the owner. A quiet repository
+therefore loses this check exactly when it needs it most. That failure mode is
+visible as an absence of runs in the Actions tab rather than as a green result, and
+`workflow_dispatch` is the manual fallback. Anyone relying on this should confirm
+periodically that the workflow is still enabled.
 
 The gate is fail-closed by design. It distinguishes three outcomes — the scan
 found nothing (PASS), the scan found something at or above `high` (FAIL), and the

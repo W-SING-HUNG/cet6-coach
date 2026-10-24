@@ -4,27 +4,46 @@
  *
  * 鈹€鈹€ What this checks, and why each one is a real failure mode 鈹€鈹€
  *
- * 1. **The YAML parses.** A workflow with a syntax error does not fail loudly:
- *    GitHub reports no checks at all, and a branch protection rule that requires
- *    a status check then blocks every pull request 鈥?or, worse, on a repository
- *    without required checks, applies no gate while looking healthy.
+ * 1. **The files are readable and structurally anchored.** A workflow with a
+ *    syntax error does not fail loudly: GitHub reports no checks at all, and a
+ *    branch protection rule that requires a status check then blocks every pull
+ *    request — or, worse, on a repository without required checks, applies no gate
+ *    while looking healthy.
+ *
+ *    ── What this gate does and does not do about YAML ──
+ *
+ *    It does **not** parse the YAML into a document tree, and does not claim to.
+ *    There is no YAML parser in this repository's dependency tree: `js-yaml` is
+ *    present only as a transitive package and is not resolvable from the project
+ *    root, and CONTRIBUTING.md forbids adding a dependency without a reason.
+ *
+ *    What it does instead is read each file as text, strip comments, and assert
+ *    structural anchors: block membership by indentation, key presence, and the
+ *    shape of specific values. That is sufficient for every weakening listed
+ *    below, and it fails in the safe direction — an unrecognised reformatting makes
+ *    an anchor miss, which fails the gate rather than passing it silently.
+ *
+ *    It is **not** equivalent to schema validation. Acceptance of the syntax is
+ *    decided by GitHub's own workflow loader on every run of the workflow, which is
+ *    stronger than anything here could be, and a file GitHub refuses to load
+ *    produces no checks at all — visible, not silent.
  *
  * 2. **No `continue-on-error` and no `|| true`.** Both turn a failing step into a
  *    green run. They are the two ways this repository's gates could stop gating
- *    without anyone noticing, and neither is ever correct in this workflow.
+ *    without anyone noticing, and neither is ever correct in these workflows.
  *
- * 3. **No job-level or step-level `if:` on `publication`.** The publication job
- *    must run on every pull request and every push, including from forks. An `if:`
- *    that references the actor, the fork status or a previous job's result is how
- *    "the release gate is required" quietly becomes "the release gate is required
- *    when convenient".
+ * 3. **No job-level `if:` on any job.** Every job must run on every pull request
+ *    and every push, including from forks. An `if:` referencing the actor, the fork
+ *    status or a previous job's result is how "the release gate is required"
+ *    quietly becomes "the release gate is required when convenient".
  *
- * 4. **`quality` and `publication` are independent.** `publication` must not list
- *    `needs:`. A publication job that waits on `quality` stops publishing-completeness
- *    checks from running when the build is red, which is exactly when a broken tree
- *    must still be proven not to contain private material.
+ * 4. **No job declares `needs:`.** `quality`, `browser` and `publication` are
+ *    independent on purpose. A publication job that waits on `quality` stops
+ *    publishing-completeness checks from running when the build is red, which is
+ *    exactly when a broken tree must still be proven not to contain private
+ *    material.
  *
- * 5. **The two documented job names are unchanged.** They are the identifiers in
+ * 5. **The three documented job names are unchanged.** They are the identifiers in
  *    the branch protection rule. Renaming one silently removes the required check.
  *
  * 6. **Permissions stay minimal.** The workflow-level permissions must be exactly
@@ -41,12 +60,21 @@
  *    name the specs explicitly (not rely on "everything under e2e/"), must not pass
  *    `--pass-with-no-tests`, and must not set `retries` above 0.
  *
- * 9. **The Dependabot configuration parses and covers both ecosystems.** An npm
- *    entry is what keeps dependencies current; a `github-actions` entry is what
- *    keeps the SHA pins above current. Losing either makes the other's maintenance
- *    manual again.
+ * 9. **The Dependabot configuration covers both ecosystems.** An npm entry is what
+ *    keeps dependencies current; a `github-actions` entry is what keeps the SHA
+ *    pins current. Losing either makes the other's maintenance manual again.
  *
- * 鈹€鈹€ What it deliberately does not do 鈹€鈹€
+ * 10. **This gate is actually wired into CI.** A guard that nothing invokes is a
+ *    document. The publication job must run both this gate and its controls, so a
+ *    future edit that removes that wiring fails the very run it was meant to
+ *    protect.
+ *
+ * 11. **The scheduled dependency workflow exists and stays honest.** A daily
+ *    advisory check is the only thing that catches an advisory published against an
+ *    unchanged lockfile. It must exist, keep least privilege, keep a manual
+ *    trigger, and call the same gate rather than a second scanner.
+ *
+ * ── What it deliberately does not do ──
  *
  * It does not reach the network or call the GitHub API. Whether a *pinned SHA* is
  * still the latest release is a question for Dependabot, which is configured to
@@ -78,26 +106,30 @@ function check(label, condition, detail = "") {
   }
 }
 
-/**
- * A minimal YAML reader for the subset these files use.
+/*
+ * ── The structural reader, stated precisely ──
  *
- * 鈹€鈹€ Why not a YAML library 鈹€鈹€
+ * The checks below read these files as **text**, not as a parsed document tree.
+ * There is no YAML parser available to this project (see item 1 in the header),
+ * so the reader is deliberately minimal: split into lines, strip comments, and
+ * identify blocks by indentation.
  *
- * The repository has no YAML dependency and CONTRIBUTING.md says not to add one
- * without a reason. Parsing GitHub workflow YAML in full would need a real
- * implementation; what this gate actually needs is narrower and structurally
- * checkable from the text:
+ * What it can therefore assert:
  *
  *   - the job block names and their indentation,
- *   - which steps belong to which job,
- *   - the presence of specific keys at specific indentation levels.
+ *   - which lines belong to which job,
+ *   - the presence of specific keys at specific indentation levels,
+ *   - the exact text of values it cares about (job names, `run:` commands).
  *
- * A line-oriented scan answers all of those, and it fails in the safe direction:
- * if the file is reformatted in a way this reader does not understand, the
- * assertions below miss their anchors and fail, rather than silently passing.
+ * What it cannot assert: that the document is valid YAML, that anchors and
+ * aliases resolve, or that a value has the type GitHub expects. Those are the
+ * workflow loader's job, which runs on every push of this file.
  *
- * `parseYamlDocument` is therefore not a general parser. It is a check that the
- * textual structure a reader depends on is present.
+ * The trade is explicit: a handful of regexes against a dependency-free reader,
+ * with the failure mode biased toward false refusal. A reformatting this reader
+ * does not recognise loses its anchors and fails the gate, which is noisy and
+ * safe; the alternative failure — passing silently — is the one this whole file
+ * exists to prevent.
  */
 
 const WORKFLOW = join(ROOT, ".github", "workflows", "verify.yml");
@@ -424,9 +456,140 @@ if (existsSync(DEPENDABOT)) {
     "grouping security updates keeps a multi-package advisory as one reviewable fix",
   );
 }
+// ── 9. this gate is wired into CI, and so are its controls ──
+/*
+ * ── Why a gate checks its own wiring ──
+ *
+ * The first version of this file was written, reviewed, and never invoked by any
+ * workflow. It passed locally and in `pnpm verify`, and it guarded nothing on a
+ * pull request — which is the exact defect its own header describes, committed by
+ * the file that describes it.
+ *
+ * That is not an argument for trusting the author more carefully next time. It is
+ * an argument that "the gate runs in CI" has to be an assertion, not a memory. So
+ * the publication job must invoke this gate and its controls, and removing either
+ * line fails the run it was meant to protect.
+ *
+ * The publication job is the right home: it is the job that cannot be skipped, so
+ * a browser or build failure cannot suppress the check on the CI configuration.
+ */
+const publicationBlock = jobBlock("publication");
+if (publicationBlock === null) {
+  check("publication job present for CI-configuration assertions", false);
+} else {
+  const publicationText = publicationBlock.lines.join("\n");
+  check(
+    "publication job runs the workflow integrity gate",
+    publicationText.includes("tools/check-workflow-integrity.mjs"),
+    "a gate nothing invokes is a document, not a control",
+  );
+  check(
+    "publication job runs the workflow integrity controls",
+    publicationText.includes("tools/workflow-integrity-controls.mjs"),
+    "the gate's own ability to fail must be exercised on every pull request too",
+  );
+  check(
+    "publication job still runs every pre-existing release gate",
+    [
+      "tools/public-release-check.mjs",
+      "tools/audit-history.mjs",
+      "tools/audit-object-database.mjs",
+      "tools/check-exam-fingerprints.mjs",
+      "tools/check-doc-references.mjs",
+      "tools/gate-negative-controls.mjs",
+      "tools/secret-scan-controls.mjs",
+      "tools/workspace-path-controls.mjs",
+      "tools/license-check-controls.mjs",
+      "tools/guard-token-scanner.mjs",
+      "tools/guard-source-doc-refs.mjs",
+      "tools/guard-role-references.mjs",
+      "tools/check-release-archive.mjs",
+    ].every((tool) => publicationText.includes(tool)),
+    "the history, privacy, object, secret and artefact gates must all survive",
+  );
+}
 
-console.log("");
-if (JSON_OUTPUT) {
+// ── 10. the scheduled dependency workflow ──
+/*
+ * ── Why a second workflow file is checked here rather than trusted ──
+ *
+ * The scheduled audit is the only mechanism that catches an advisory published
+ * against an unchanged lockfile — the case where no commit happens to trigger the
+ * pull-request gate. Three `undici` advisories appeared that way during this
+ * project. A daily run is therefore load-bearing, and a load-bearing workflow
+ * needs the same treatment as the required ones.
+ *
+ * What is asserted here is the configuration only. Whether the schedule actually
+ * fires cannot be checked from a pull request: GitHub ignores `schedule` triggers
+ * on non-default branches, runs can be delayed, and scheduled workflows are
+ * disabled automatically on inactive public repositories. The first real
+ * scheduled or manual run can only be accepted after this merges.
+ */
+const SCHEDULED = join(ROOT, ".github", "workflows", "dependency-security.yml");
+check("scheduled dependency workflow exists", existsSync(SCHEDULED));
+
+if (existsSync(SCHEDULED)) {
+  const scheduledRaw = readFileSync(SCHEDULED, "utf8");
+  const scheduledCode = stripYamlComments(scheduledRaw);
+
+  check(
+    "scheduled workflow declares a cron schedule",
+    /^\s*-\s*cron:\s*["']?\S+/m.test(scheduledCode),
+    "without a cron entry the workflow would only ever run manually",
+  );
+  check(
+    "scheduled workflow supports manual dispatch",
+    /^ {2}workflow_dispatch:\s*$/m.test(scheduledCode),
+    "a manual trigger is the fallback when the schedule is delayed or disabled",
+  );
+  check(
+    "scheduled workflow keeps least privilege",
+    /^permissions:\s*\n\s+contents:\s*read\s*$/m.test(scheduledCode) && !/^\s+\S+:\s*write\s*$/m.test(scheduledCode),
+    "the scheduled job must stay read-only",
+  );
+  check(
+    "scheduled workflow calls the same dependency gate, not a second scanner",
+    scheduledCode.includes("tools/check-dependency-security.mjs"),
+    "two implementations of the same check can disagree; there must be one",
+  );
+  check(
+    "scheduled workflow also runs the gate's controls",
+    scheduledCode.includes("tools/dependency-security-controls.mjs"),
+    "a nightly PASS is only meaningful if the gate can still fail",
+  );
+  check(
+    "scheduled workflow does not retry Chromium or the full release flow",
+    !/playwright/i.test(scheduledCode) && !/check-release-archive|public-release-check|audit-history/.test(scheduledCode),
+    "a daily run must stay cheap; Chromium and the publication gates belong to verify.yml",
+  );
+  check(
+    "scheduled workflow does not open or merge pull requests",
+    !/(pulls|merge|approve|gh pr create)/i.test(scheduledCode),
+    "this workflow reports; deciding what to do with a finding is a human action",
+  );
+  check(
+    "scheduled workflow uses no secret",
+    !/\$\{\{\s*secrets\./.test(scheduledRaw),
+    "no secret is needed to query a public advisory index",
+  );
+  check(
+    "scheduled workflow pins its actions to full commit SHAs",
+    (() => {
+      const refs = [...scheduledCode.matchAll(/uses:\s*(\S+)/g)]
+        .map((match) => match[1])
+        .filter((reference) => !reference.startsWith("./"));
+      return refs.length > 0 && refs.every((reference) => /@[0-9a-f]{40}$/.test(reference));
+    })(),
+    "an unpinned action in a scheduled workflow is the same supply-chain risk as anywhere else",
+  );
+  check(
+    "scheduled workflow does not suppress failures",
+    !/continue-on-error|\|\|\s*true\b/.test(scheduledCode),
+    "a scheduled scan that cannot fail is a nightly no-op",
+  );
+}
+
+console.log("");if (JSON_OUTPUT) {
   console.log(JSON.stringify({ failures, problems }, null, 2));
 }
 if (failures > 0) {

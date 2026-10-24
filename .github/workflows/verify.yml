@@ -386,6 +386,56 @@ jobs:
         # the reader cannot tell which statements to trust.
         run: node tools/check-doc-references.mjs
 
+      # ── The CI configuration itself is part of what ships ──
+      #
+      # Everything above this point checks the tree. This checks the machinery
+      # that decides whether the tree is allowed to be published, which is a
+      # weaker link in practice: the workflow is the one file where a one-line edit
+      # can silently remove a gate, and the result of that edit is a *green* run
+      # that no longer means anything.
+      #
+      # It belongs to the publication job rather than the quality job because it
+      # is a release-safety question, and because this job is the one that must
+      # not be skippable: a browser or build failure cannot suppress it.
+
+      - name: CI configuration integrity
+        # Asserts the properties a required check depends on and that a reviewer
+        # would otherwise have to hold in their head: the three required-check
+        # names, no `continue-on-error` / `|| true` / `set +e` anywhere, no
+        # job-level `if:` that a fork PR fails, no `needs:` linking the release
+        # gate to the build, `contents: read` and no write escalation, every
+        # external action pinned to a full commit SHA with its release recorded,
+        # the browser job still running named specs with no retries and no
+        # zero-test escape, and Dependabot still covering both ecosystems with no
+        # `ignore:` block.
+        #
+        # Also validates the scheduled dependency-security workflow: it must
+        # exist, keep `contents: read`, keep `workflow_dispatch`, and call the
+        # same gate rather than a second implementation.
+        #
+        # ── What this gate does *not* do ──
+        #
+        # It does not parse the YAML into a document tree. It reads the files as
+        # text, strips comments, then checks structural anchors (indentation,
+        # block membership, key presence) with regular expressions. That is enough
+        # to detect every weakening it claims to detect, and it fails in the safe
+        # direction — an unrecognised reformatting makes the anchors miss and the
+        # gate fail rather than pass. It is not equivalent to a YAML parser, and
+        # the file does not claim otherwise. Syntax acceptance is decided by
+        # GitHub's own workflow loader on every run of this very file.
+        run: node tools/check-workflow-integrity.mjs
+
+      - name: CI configuration integrity controls
+        # The gate above is only worth having if it rejects what it says it
+        # rejects. Each control copies the real configuration into a throwaway
+        # tree, applies exactly one weakening, and requires a refusal: a renamed
+        # required check, a step that tolerates its own failure, a swallowed exit
+        # code, an action pinned back to a mutable tag, `needs:` on the release
+        # gate, a fork-PR `if:`, a write permission, a browser job allowed to
+        # collect nothing, the dependency gate removed, and Dependabot losing
+        # either ecosystem or gaining an `ignore:` block.
+        run: node tools/workflow-integrity-controls.mjs
+
       # ── The gates must be able to fail ──
       #
       # A positive result proves the tree is clean today. It does not prove the
