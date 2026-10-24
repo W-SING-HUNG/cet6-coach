@@ -93,18 +93,18 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
-    "@playwright/test": "^1.63.0",
+    "@playwright/test": "^1.64.1",
     "@tailwindcss/postcss": "^4",
     "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.3",
-    "@testing-library/user-event": "^14.6.7",
+    "@testing-library/user-event": "^14.6.8",
     "@types/node": "^24.13.6",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.4.2",
-    "jsdom": "^30.1.1",
-    "pdfjs-dist": "6.3.289",
+    "jsdom": "^30.1.3",
+    "pdfjs-dist": "6.4.299",
     "tailwindcss": "^4",
     "typescript": "^5",
     "vitest": "^5.0.5"
