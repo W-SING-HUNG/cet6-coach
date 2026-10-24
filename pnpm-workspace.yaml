@@ -1,6 +1,56 @@
+# ── Workspace settings ──
+#
+# This project is a single package, not a monorepo. The file exists because it
+# is where pnpm 12 reads settings from.
+
 allowBuilds:
+  # `sharp` arrives as an optional transitive dependency of Next.js and is never
+  # imported by this project (asserted in `tests/architecture.test.ts`), so its
+  # install script stays off. See THIRD-PARTY-NOTICES.md.
   sharp: false
   unrs-resolver: false
 
 overrides:
   vite: 8.3.5
+
+# ── Why pnpm must not record its own version in the lockfile ──
+#
+# pnpm 12 writes `pnpm-lock.yaml` as a **two-document YAML stream**: a small
+# "boot document" holding the resolved pnpm version, followed by the real
+# dependency graph. It does this whenever `package.json` pins pnpm 12 or newer
+# through the legacy `packageManager` field, which this project does.
+#
+# Both documents declare `lockfileVersion: '9.0'`, so a consumer implementing
+# lockfile v9 has no signal that the physical shape changed. It reads the first
+# document, finds an importer with no `dependencies`, and concludes the project
+# has no dependencies — and therefore no vulnerabilities.
+#
+# That is not theoretical. Measured on this repository before this setting was
+# added:
+#
+#   lockfile YAML documents   2
+#   GitHub dependency graph   19 packages — `pnpm`, its 15 `@pnpm/exe.*`
+#                             binaries and 3 workflow actions. `next`, `react`,
+#                             `sharp` and `pdfjs-dist` were all absent.
+#   Dependabot alerts         none, because there was nothing to match.
+#
+# A green security result computed over an empty graph is worse than no result:
+# it is a check that cannot fail. See `tools/check-dependency-graph.mjs`, which
+# fails if this file stops producing a single-document lockfile.
+#
+# `pmOnFail: ignore` is the documented switch (pnpm docs, "pmOnFail"; it replaces
+# the removed `managePackageManagerVersions: false`). It stops pnpm from
+# resolving and recording its own version, so the boot document is never written.
+#
+# Version pinning is unaffected: `package.json` still declares pnpm@12.4.2 in
+# `packageManager`, and `pnpm install --frozen-lockfile` still enforces the
+# lockfile. CI installs pnpm 12.4.2 through `pnpm/action-setup`, which reads that
+# same field.
+#
+# Verified when introduced: regenerating the lockfile this way changed the
+# resolved snapshot set by zero entries (380 before, 380 after, no diff); only
+# the boot document disappeared.
+#
+# Revisit if dependabot/dependabot-core#15904 lands: the preferred end state is a
+# two-document lockfile that scanners actually read.
+pmOnFail: ignore

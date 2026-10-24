@@ -64,6 +64,10 @@
     "release:check": "node tools/public-release-check.mjs",
     "release:notices": "node tools/dependency-notices.mjs",
     "release:docs": "node tools/check-doc-references.mjs",
+    "release:deps": "node tools/check-dependency-security.mjs",
+    "release:deps-controls": "node tools/dependency-security-controls.mjs",
+    "release:workflow": "node tools/check-workflow-integrity.mjs",
+    "release:workflow-controls": "node tools/workflow-integrity-controls.mjs",
     "test:ci": "vitest run --maxWorkers=4",
     "release:history": "node tools/audit-history.mjs",
     "release:secrets": "node --experimental-transform-types tools/secret-scan-controls.mjs",
@@ -86,7 +90,7 @@
     "react-dom": "19.2.8",
     "tailwind-merge": "^3.7.0",
     "ts-fsrs": "^5.4.2",
-    "zod": "^4.6.5"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@playwright/test": "^1.63.0",

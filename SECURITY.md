@@ -116,6 +116,109 @@ artefact — private content, personal data, internal notes, or third-party mate
 without redistribution rights — treat it as a security report and use the private
 channel above. Do not paste the material into a public issue.
 
+## Dependency update policy
+
+### What is checked automatically, and when
+
+Three mechanisms, because each covers a gap the others cannot:
+
+| Mechanism | Covers | Runs |
+| --- | --- | --- |
+| `tools/check-dependency-security.mjs` | advisories against the resolved versions in `pnpm-lock.yaml` | every push and PR (`quality` job of `verify.yml`) |
+| The same gate, on a schedule | the same advisories, when **nothing in the repository changed** | daily at 04:17 UTC, and on demand (`dependency-security.yml`) |
+| Dependabot (`.github/dependabot.yml`) | *new* versions of what is pinned, including the workflow actions | weekly, Monday 06:00 Asia/Shanghai |
+
+The second row is not redundant. A push-triggered scan only runs when a commit
+happens, so an advisory published against a version that is already pinned can sit
+unnoticed indefinitely. That is not hypothetical here: three `undici` advisories
+were published against the pinned version between two commits during this project,
+and the push-triggered gate would only have caught them at the next unrelated push.
+
+The scheduled workflow calls the **same** `tools/check-dependency-security.mjs`, so
+there is one definition of "is this tree vulnerable" rather than two that can
+disagree. It also runs the gate's controls, so a nightly green cannot come from a
+gate that was quietly weakened.
+
+| Scheduled check | Detail |
+| --- | --- |
+| Trigger | `schedule` (`17 4 * * *`, UTC) and `workflow_dispatch` |
+| Permissions | `contents: read` |
+| Secrets | none |
+| Scope | `pnpm install --frozen-lockfile`, the gate, the controls. No Chromium, no build, no publication gates |
+| On a finding | the run fails; it does not open, approve or merge a PR |
+
+**What the schedule cannot promise.** GitHub ignores `schedule` triggers on
+non-default branches, so this mechanism cannot be exercised from a pull request —
+its configuration is verified there, and its first real run can only be accepted
+after merge. Scheduled runs can also start late, and GitHub **disables scheduled
+workflows on inactive public repositories**, notifying the owner. A quiet repository
+therefore loses this check exactly when it needs it most. That failure mode is
+visible as an absence of runs in the Actions tab rather than as a green result, and
+`workflow_dispatch` is the manual fallback. Anyone relying on this should confirm
+periodically that the workflow is still enabled.
+
+The gate is fail-closed by design. It distinguishes three outcomes — the scan
+found nothing (PASS), the scan found something at or above `high` (FAIL), and the
+scan **could not run** (ERROR, non-zero). A blocked advisory endpoint is an ERROR,
+never a silently clean result. It also refuses to report on a lockfile whose
+dependency graph is empty or unreadable, because "no vulnerabilities in zero
+packages" is not a finding.
+
+`tools/dependency-security-controls.mjs` proves all three outcomes are reachable,
+so a PASS cannot mean "the check was never wired up".
+
+> **No single source finds every vulnerability.** The gate queries the npm advisory
+> index, keyed by exact resolved versions. It cannot see an unpublished advisory, a
+> compromised package that has not been reported yet, a vulnerability inside a
+> prebuilt native binary, or anything outside npm. It is one layer. Pinning,
+> `--frozen-lockfile`, SHA-pinned workflow actions and human review are the others.
+
+### Repository settings this file cannot control
+
+Dependabot **alerts** and the dependency graph are repository settings, not
+configuration files. Their current state is reported in each release's notes
+rather than asserted here, because a document that claims a setting is on cannot
+verify it.
+
+One consequence worth stating explicitly: Dependabot *security* updates are a
+separate switch from the version updates configured in `.github/dependabot.yml`.
+Opening a pull request that fixes an advisory does not require that switch, but
+having alerts tracked in the Security tab does require the dependency graph to be
+readable — which is why `pnpm-workspace.yaml` pins `pmOnFail: ignore`. Without it
+pnpm 12 writes a two-document lockfile and the graph reports zero dependencies.
+
+### Scoped exception: `braces` reached only through the lint toolchain
+
+Recorded here rather than suppressed in `dependabot.yml`, because an `ignore:`
+entry would also suppress security updates for that package.
+
+| | |
+| --- | --- |
+| Package | `braces@3.0.3` |
+| Advisory | `GHSA-vfj7-8cjw-p6xm` — stack exhaustion from deeply nested patterns |
+| Dependency path | `braces` → `micromatch` → `fast-glob` → `@next/eslint-plugin-next` → `eslint-config-next` |
+| Reachable from | development only (`devDependencies`); no runtime path |
+| Upstream fix | none available — `3.0.3` is the newest published version |
+| Status at the time of writing | the advisory was **withdrawn** on 2026-10-23 |
+
+Why this is recorded rather than fixed: there is no fixed version to move to, and
+the package is only reachable from the lint toolchain, which never ships. Why it is
+recorded at all: "we decided this is fine" needs a date and a re-check condition, or
+it silently becomes "we forgot".
+
+**Re-check when any of the following becomes true:**
+
+1. `braces` publishes a version above `3.0.3` — move to it and delete this entry.
+2. The advisory is re-published (a withdrawal can be reversed) — re-assess against
+   the actual dependency path before accepting it.
+3. `eslint-config-next` stops depending on `micromatch`/`fast-glob`, or `micromatch`
+   moves to a patched range — the path disappears and this entry is stale.
+4. `braces` becomes reachable from anything other than `devDependencies` — this
+   exception is void and the dependency needs a real fix.
+
+The gate above does not suppress this package; if the advisory is reinstated, the
+automatic scan will report it and this record is what a reviewer compares against.
+
 ## Known, accepted limitations
 
 Documented rather than hidden:

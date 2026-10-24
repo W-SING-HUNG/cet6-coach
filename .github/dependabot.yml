@@ -1,0 +1,115 @@
+# Dependabot configuration.
+#
+# ── The intended shape of this file: few, reviewable pull requests ──
+#
+# Every option below was chosen to keep the number of open pull requests small
+# enough that a human actually reads them. An update bot whose pull requests are
+# ignored is worse than no bot: it produces the appearance of maintenance while
+# nothing gets merged.
+#
+# ── Why there is no `ignore:` entry ──
+#
+# `ignore:` applies to *security* updates as well as version updates. Suppressing
+# a transitive advisory by name would therefore suppress the fix for it too, which
+# is the opposite of the intent. Where an advisory genuinely has no fix and is not
+# reachable from production code, the decision and its re-check condition are
+# recorded in SECURITY.md instead — visible, dated, and revocable — rather than
+# encoded as a rule that silently hides future alerts.
+#
+# ── What this file does not do ──
+#
+# It does not enable Dependabot *security* updates, which is a repository setting
+# rather than a file. See SECURITY.md, "Dependency update policy", for the current
+# state of that setting and what it means for alert coverage.
+
+version: 2
+
+updates:
+  # ── npm dependencies, resolved through pnpm ──
+  #
+  # `package-ecosystem: "npm"` is correct for pnpm: Dependabot treats pnpm as an
+  # npm-ecosystem package manager and reads `pnpm-lock.yaml` directly. There is no
+  # separate "pnpm" ecosystem value.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      # Monday, so a batch can be reviewed at the start of a week rather than
+      # appearing mid-review on a Friday.
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Shanghai"
+    # Version updates only ever open a handful of pull requests at a time.
+    open-pull-requests-limit: 5
+    commit-message:
+      # The repository's commit style is a plain prefix; matching it keeps the
+      # history uniform whether a human or the bot wrote the commit.
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps-dev)"
+    groups:
+      # ── Runtime dependencies: patch and minor together ──
+      #
+      # Patch and minor updates within a major version are the ones where a
+      # combined pull request is a reasonable review unit: the CI gate runs the
+      # full suite over the result, and a failure points at the group.
+      #
+      # Major updates are deliberately NOT grouped, below. A major bump is a
+      # migration with its own reasoning; batching several of them into one pull
+      # request makes both the diff and the failure impossible to attribute.
+      runtime-minor-patch:
+        applies-to: version-updates
+        dependency-type: "production"
+        update-types:
+          - "minor"
+          - "patch"
+      # ── Development tooling: patch and minor together ──
+      #
+      # Separate from runtime so that a development-tool bump never rides along
+      # with a change to what ships. The two have different blast radii and
+      # different review questions.
+      dev-minor-patch:
+        applies-to: version-updates
+        dependency-type: "development"
+        update-types:
+          - "minor"
+          - "patch"
+      # ── Security updates get their own group ──
+      #
+      # `applies-to: security-updates` is what makes these visible as security
+      # work rather than as routine maintenance. Kept as one group because a
+      # single advisory often spans several packages in one tree, and splitting
+      # them produces a partial fix and several half-open pull requests.
+      security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # ── GitHub Actions ──
+  #
+  # The workflows pin every action to a full commit SHA (see verify.yml). This
+  # ecosystem entry is what keeps those pins current: Dependabot understands SHA
+  # pins and rewrites both the SHA and the trailing version comment.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      # Two actions in the same release train (checkout and setup-node, for
+      # example) are one review, not two.
+      actions-minor-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      actions-security:
+        applies-to: security-updates
+        patterns:
+          - "*"

@@ -2,17 +2,18 @@ name: verify
 
 # ── What this workflow is and is not ──
 #
-# Two different questions need two different jobs, and conflating them is how
+# Three different questions need three different jobs, and conflating them is how
 # release gates end up bypassing themselves:
 #
 #   `quality`     — does the code work?      (lint, types, tests, build)
+#   `browser`     — does the UI work?        (Chromium, synthetic content only)
 #   `publication` — may this tree be shipped? (content policy, secrets, history,
 #                   artefact boundary, regression guards)
 #
-# The publication job is deliberately **not** gated on `quality` and does not
-# skip itself when quality fails. A broken build must never be able to suppress
-# the check that stops private material being published. For the same reason it
-# does not use `if:` conditions that let a fork PR skip it.
+# The publication job is deliberately **not** gated on `quality` or `browser` and
+# does not skip itself when they fail. A broken build must never be able to
+# suppress the check that stops private material being published. For the same
+# reason it does not use `if:` conditions that let a fork PR skip it.
 #
 # ── Coverage, and why each gate is here ──
 #
@@ -28,21 +29,60 @@ name: verify
 #
 # ── Least privilege ──
 #
-# `contents: read` for the whole workflow. Neither job writes to the repository,
+# `contents: read` for the whole workflow. No job writes to the repository,
 # comments on the PR, uploads an artefact or uses a secret, so a pull request from
 # a fork gets exactly the same verdict as a branch. No Owner credential is
 # available to this workflow, which is what makes it safe to run on untrusted
 # code: there is nothing to steal and nothing to write.
+#
+# The one exception is `pull-requests: read` on the browser job, which is not used
+# by any step. It is deliberately *not* added: no step needs it, and an unused
+# write-adjacent permission on a workflow that runs on fork PRs is a liability
+# with no benefit.
+#
+# ── Actions are pinned to commit SHAs ──
+#
+# A version tag is a mutable pointer: `@v4` can be repointed at new code without
+# any change in this repository, and that new code runs with this workflow's
+# permissions. A full commit SHA is immutable, so the code that runs is the code
+# that was reviewed.
+#
+# Each pin records the release it came from. To re-verify or bump one:
+#
+#   gh api repos/{owner}/{repo}/git/ref/tags/{tag}      # tag object (annotated)
+#   gh api repos/{owner}/{repo}/git/tags/{sha}          # → commit sha
+#   gh api repos/{owner}/{repo}/commits/{sha}           # confirm the release commit
+#
+# `.github/dependabot.yml` keeps these current: Dependabot understands SHA pins
+# and rewrites both the SHA and the trailing comment.
+#
+# Version choices, and why not older majors:
+#
+#   actions/checkout@v7.0.1      — v4 runs on the deprecated Node 20 runner.
+#                                  v5/v6 also moved to Node 24; v7 is the current
+#                                  stable line and additionally refuses to check
+#                                  out fork PRs under `pull_request_target` /
+#                                  `workflow_run`, which this workflow does not use
+#                                  but which is the right default to be on.
+#   actions/setup-node@v7.1.0    — current stable; reads `packageManager` from
+#                                  package.json for its pnpm cache, so the cache
+#                                  key cannot drift from the pinned version.
+#   pnpm/action-setup@v6.1.0     — 6.1.0 is the release that adds pnpm v12
+#                                  support. Anything older cannot install the
+#                                  version this repository pins, so this is a
+#                                  requirement rather than a preference.
 #
 # ── Required status checks for branch protection ──
 #
 # The job `name:` values are the check names to require:
 #
 #   "lint, types, tests, build"
+#   "browser (synthetic)"
 #   "public release gate"
 #
-# Requiring both is the point of the split: a green quality run must not be able
-# to stand in for a missing publication verdict.
+# Requiring all three is the point of the split: a green quality run must not be
+# able to stand in for a missing publication verdict, and neither can stand in for
+# a browser flow that never ran.
 
 on:
   push:
@@ -66,17 +106,17 @@ jobs:
     timeout-minutes: 40
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           # Reads `packageManager` from package.json; do not duplicate the
           # version here, or the two will drift.
           run_install: false
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: pnpm
@@ -85,6 +125,33 @@ jobs:
         # `--frozen-lockfile` is a supply-chain control, not a convenience: it
         # guarantees CI installs exactly the resolved tree that was reviewed.
         run: pnpm install --frozen-lockfile
+
+      - name: Dependency security scan
+        # ── Why this is a gate and not an advisory print ──
+        #
+        # A vulnerability scan has three outcomes and only one of them is good
+        # news: it found nothing, it found something, or it could not run. The
+        # third is the dangerous one, because a scan that never happened produces
+        # the same green output as a clean tree. This gate separates all three and
+        # exits non-zero for the last two.
+        #
+        # It also refuses a lockfile that scanners cannot read. pnpm 12 writes
+        # `pnpm-lock.yaml` as two YAML documents by default, and a single-document
+        # reader takes the first — a "boot document" describing no dependencies —
+        # and concludes the project has none. Measured on this repository while
+        # that was true: the platform dependency graph reported 19 packages, all
+        # of them pnpm's own binaries plus three workflow actions, with `next` and
+        # `react` absent. Every Dependabot alert type was inert.
+        #
+        # `pnpm-workspace.yaml` carries `pmOnFail: ignore` to keep the lockfile
+        # single-document, and this step fails if that ever stops being true.
+        run: node tools/check-dependency-security.mjs
+
+      - name: Dependency security controls
+        # Proves the gate above can fail in each of its three ways, because a
+        # verdict that has never been observed is indistinguishable from a
+        # hard-coded "PASS".
+        run: node tools/dependency-security-controls.mjs
 
       - name: Lint
         run: pnpm lint
@@ -112,6 +179,114 @@ jobs:
         # files, so they belong to the job that builds.
         run: pnpm verify:scanner && node tools/guard-build-boundary.mjs
 
+  browser:
+    name: browser (synthetic)
+    runs-on: ubuntu-latest
+
+    # ── What this job is for ──
+    #
+    # The unit suite asserts the service layer. It cannot see a Server Action that
+    # rejects a valid form, a redirect chain that stops redirecting, or a reveal
+    # endpoint that returns content when it should refuse. Those are browser facts,
+    # and until this job existed they were only ever checked by a human running
+    # `pnpm e2e` locally.
+    #
+    # ── Why the whole 180-test suite is not here ──
+    #
+    # The full suite is 4.5 minutes of test time and covers layout, visual
+    # evidence, viewport geometry and scroll-position memory — valuable, but a
+    # careful review of pixels does not belong on every push to every branch. What
+    # runs here is the subset whose failure would mean the product is broken
+    # rather than merely imperfect: navigation, settings persistence, and the
+    # course-content boundary in both directions.
+    #
+    # ── Privacy: synthetic content only ──
+    #
+    # The specs below run against `playwright.config.ts`, whose webServer list is
+    # the synthetic one. The real-content launcher exists only in
+    # `playwright.real.config.ts`, which requires an explicit `--config` flag and
+    # is not reachable from any command here. `tests/e2e-privacy-config.test.ts`
+    # asserts that separation by reading the actual config objects.
+    #
+    # No screenshot, trace or log from this job is uploaded. They are written
+    # under `.e2e/` and die with the runner; that keeps a future
+    # `upload-artifact` from turning a test screenshot into a published document
+    # without anyone deciding to publish it.
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # ── The browser must be the one the lockfile expects ──
+      #
+      # `@playwright/test` is pinned through the lockfile, and each Playwright
+      # release expects a specific Chromium build. Installing "latest chromium"
+      # would test the application against a browser the project never resolved.
+      # With no version argument, `playwright install` reads the version from the
+      # installed package, so the browser and the driver always match.
+      #
+      # `--with-deps` installs the Linux shared libraries Chromium needs. Without
+      # it the browser launches and immediately fails on a missing `.so`, which
+      # reads as a test failure rather than the setup problem it is.
+      - name: Install Chromium and its system dependencies
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Production build
+        # The synthetic webServers run `next start`, not `next dev`: the E2E
+        # configuration documents that dev-server compilation jitter makes
+        # cross-page flows flaky, and that the production build is the thing under
+        # acceptance. So the build has to happen before any spec runs.
+        run: pnpm build
+
+      - name: Chromium flows (synthetic content)
+        # ── Why `retries: 0` and no `--pass-with-no-tests` ──
+        #
+        # A retry turns a flake into a green run and hides the flake. These three
+        # specs drive a deterministic production build against a fresh database;
+        # a failure here is information, and the honest response is to read it.
+        #
+        # There is no `continue-on-error` and no `|| true`. A failure in this step
+        # fails the job, and the job is a required check, so a broken browser flow
+        # blocks the pull request.
+        #
+        # `--reporter=list,json` writes a machine-readable result file so the step
+        # log and the assertion count can both be inspected. A run that collected
+        # zero tests is reported as such by Playwright rather than passing.
+        #
+        # ── What each spec covers ──
+        #
+        #   flow.spec.ts              navigation and initialisation: onboarding →
+        #                             diagnostic → result → Today → submit →
+        #                             reload, with persistence assertions.
+        #   settings.spec.ts          learning settings are saved and survive a
+        #                             reload, and an invalid value is refused
+        #                             rather than silently dropped.
+        #   course-companion.spec.ts  the course-content boundary: a same-origin
+        #                             POST returns a passage with `no-store`, and
+        #                             a missing or wrong risk fingerprint is
+        #                             refused with 409 and no body.
+        run: >-
+          pnpm exec playwright test
+          e2e/flow.spec.ts
+          e2e/settings.spec.ts
+          e2e/course-companion.spec.ts
+          --reporter=list
+          --retries=0
+
   publication:
     name: public release gate
     runs-on: ubuntu-latest
@@ -120,7 +295,7 @@ jobs:
     steps:
       # ── Full history is required by this job, so ask for it ──
       #
-      # `actions/checkout@v4` fetches **one commit** unless told otherwise. That
+      # `actions/checkout` fetches **one commit** unless told otherwise. That
       # default silently hollowed out the history gate: `audit-history.mjs` scans
       # `git log --all`, which on a depth-1 clone sees only the checked-out commit,
       # so it printed PASS after examining 1 of the repository's commits. The
@@ -144,12 +319,12 @@ jobs:
       # A pull_request event checks out GitHub's synthetic `refs/pull/N/merge`
       # commit; fetching full history there yields the union of both parents'
       # ancestry, which is exactly the range that must be audited.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
 
@@ -172,7 +347,7 @@ jobs:
       # Placed after setup-node so that pnpm links against the same Node the
       # rest of the job uses.
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           # Reads `packageManager` from package.json; do not duplicate it here.
           run_install: false
@@ -210,6 +385,56 @@ jobs:
         # class of defect as a gate that claims to check something it does not:
         # the reader cannot tell which statements to trust.
         run: node tools/check-doc-references.mjs
+
+      # ── The CI configuration itself is part of what ships ──
+      #
+      # Everything above this point checks the tree. This checks the machinery
+      # that decides whether the tree is allowed to be published, which is a
+      # weaker link in practice: the workflow is the one file where a one-line edit
+      # can silently remove a gate, and the result of that edit is a *green* run
+      # that no longer means anything.
+      #
+      # It belongs to the publication job rather than the quality job because it
+      # is a release-safety question, and because this job is the one that must
+      # not be skippable: a browser or build failure cannot suppress it.
+
+      - name: CI configuration integrity
+        # Asserts the properties a required check depends on and that a reviewer
+        # would otherwise have to hold in their head: the three required-check
+        # names, no `continue-on-error` / `|| true` / `set +e` anywhere, no
+        # job-level `if:` that a fork PR fails, no `needs:` linking the release
+        # gate to the build, `contents: read` and no write escalation, every
+        # external action pinned to a full commit SHA with its release recorded,
+        # the browser job still running named specs with no retries and no
+        # zero-test escape, and Dependabot still covering both ecosystems with no
+        # `ignore:` block.
+        #
+        # Also validates the scheduled dependency-security workflow: it must
+        # exist, keep `contents: read`, keep `workflow_dispatch`, and call the
+        # same gate rather than a second implementation.
+        #
+        # ── What this gate does *not* do ──
+        #
+        # It does not parse the YAML into a document tree. It reads the files as
+        # text, strips comments, then checks structural anchors (indentation,
+        # block membership, key presence) with regular expressions. That is enough
+        # to detect every weakening it claims to detect, and it fails in the safe
+        # direction — an unrecognised reformatting makes the anchors miss and the
+        # gate fail rather than pass. It is not equivalent to a YAML parser, and
+        # the file does not claim otherwise. Syntax acceptance is decided by
+        # GitHub's own workflow loader on every run of this very file.
+        run: node tools/check-workflow-integrity.mjs
+
+      - name: CI configuration integrity controls
+        # The gate above is only worth having if it rejects what it says it
+        # rejects. Each control copies the real configuration into a throwaway
+        # tree, applies exactly one weakening, and requires a refusal: a renamed
+        # required check, a step that tolerates its own failure, a swallowed exit
+        # code, an action pinned back to a mutable tag, `needs:` on the release
+        # gate, a fork-PR `if:`, a write permission, a browser job allowed to
+        # collect nothing, the dependency gate removed, and Dependabot losing
+        # either ecosystem or gaining an `ignore:` block.
+        run: node tools/workflow-integrity-controls.mjs
 
       # ── The gates must be able to fail ──
       #

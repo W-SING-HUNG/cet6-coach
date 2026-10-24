@@ -1,0 +1,147 @@
+name: dependency security (scheduled)
+
+# ── What this workflow is for ──
+#
+# `verify.yml` runs the dependency security gate on every push and every pull
+# request. That covers the case where the repository changes. It does not cover
+# the other case: the repository does not change, and an advisory is published
+# against a version that is already pinned.
+#
+# That gap is real and was observed during this project. Between two consecutive
+# pushes, three `undici` advisories went live against the version already in the
+# lockfile. No commit triggered a re-check; the existing gate would only have
+# noticed it at the next unrelated push. A daily run closes it.
+#
+# ── Why this is a separate workflow and not a fifth job in verify.yml ──
+#
+# `verify.yml` is triggered by push and pull_request, with a concurrency group that
+# cancels superseded runs. A scheduled job inside it would inherit both: it would
+# be cancelled by a commit landing mid-run, and it would share the group with PR
+# runs of the same ref. More importantly, `verify.yml` is a *required check*. A
+# scheduled job that fails overnight would leave a red status on the default
+# branch, which is a different signal from "this pull request broke something" and
+# should not be conflated with it.
+#
+# Keeping it separate also means the expensive parts of `verify.yml` — Chromium,
+# the full build, the publication gates — do not run daily. This workflow is one
+# `pnpm install`, one gate invocation, and its controls.
+#
+# ── Constraints this file respects ──
+#
+#   - **Minimum permissions.** `contents: read`, same as verify.yml. Nothing here
+#     writes to the repository, comments on anything, or uses a secret.
+#   - **No duplicate scanner.** It calls `tools/check-dependency-security.mjs`,
+#     the same file the pull-request gate uses. There is one implementation of
+#     "is this tree vulnerable", not two that can disagree.
+#   - **No automatic fixes.** This workflow reports. It does not open, approve or
+#     merge a pull request, and it does not enable Dependabot security updates.
+#     Deciding what to do with a finding is a human action.
+#   - **Manual trigger.** `workflow_dispatch` exists so a maintainer can re-check
+#     on demand — after a Dependabot pull request, or when a specific advisory is
+#     announced — without waiting for the schedule or pushing an empty commit.
+#
+# ── The honest limit of a scheduled workflow ──
+#
+# GitHub's scheduler is not a guarantee:
+#
+#   1. **It only runs on the default branch.** These triggers are ignored on
+#      feature branches, so this workflow cannot be proven end-to-end from a pull
+#      request. The pull-request-side evidence is that the configuration is valid
+#      and that the gate it calls exits non-zero correctly (see the controls step
+#      below and the workflow-integrity gate that checks this file).
+#   2. **Runs can be delayed.** Under load a scheduled run may start minutes or
+#      tens of minutes late, and `cron` in GitHub Actions is UTC only.
+#   3. **Schedules are disabled on inactive public repositories.** GitHub disables
+#      scheduled workflows after a period with no repository activity, and sends
+#      the owner a notice. A quiet repository therefore silently loses this check,
+#      which is precisely the situation the check exists for.
+#
+# Point 3 is the one that matters, and it cannot be fixed by configuration. The
+# mitigation is to say so plainly rather than to imply the check is continuous:
+# a missed run shows up as *no* scheduled run in the Actions tab, not as a pass.
+# Anyone relying on this should confirm the workflow is still enabled periodically
+# (Settings → Actions), and `workflow_dispatch` is the manual fallback.
+
+on:
+  schedule:
+    # 04:17 UTC. Deliberately not on the hour: GitHub documents that runs
+    # scheduled at the start of an hour are the most likely to be delayed,
+    # because that is when the queue is longest.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A manual run and a scheduled run should not race on the same store cache.
+  # Superseding is safe here because both are read-only.
+  group: dependency-security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    # ── Why this name ──
+    #
+    # It is not a required status check and must not become one: a scheduled job
+    # that fails because the advisory endpoint was unreachable overnight is not a
+    # reason to block a pull request. The failure is surfaced in the Actions tab
+    # and by the repository's notification settings, which is the right channel
+    # for "an advisory was published" and the wrong channel for "this PR is bad".
+    name: dependency audit (scheduled)
+    runs-on: ubuntu-latest
+
+    # One install, one scan, one controls run. The timeout is generous enough for
+    # a cold pnpm store on a slow runner and short enough that a hung advisory
+    # endpoint cannot hold a runner for an hour.
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        # `--frozen-lockfile` for the same reason as in verify.yml: the scan must
+        # describe the resolved tree the repository actually ships, not a
+        # re-resolution that could differ from the reviewed lockfile.
+        run: pnpm install --frozen-lockfile
+
+      - name: Dependency security scan
+        # ── The three verdicts, and why this step is not allowed to soften them ──
+        #
+        #   PASS   the audit ran and found nothing at or above `high`
+        #   FAIL   the audit ran and found something at or above `high`
+        #   ERROR  the audit could not run (no lockfile, no network, an
+        #          unparseable or empty response)
+        #
+        # All three are non-zero for FAIL and ERROR, so this step fails in both.
+        # An unreachable advisory index therefore shows up as a red run rather
+        # than as a quiet pass — the whole point of running on a schedule is to
+        # notice absence of evidence, and a scan that did not happen is an absence
+        # of evidence, not a clean tree.
+        #
+        # No `continue-on-error`, no `|| true`. The default audit level is `high`;
+        # do not lower it here, or a scheduled run and a PR run would disagree
+        # about what counts as a finding.
+        run: node tools/check-dependency-security.mjs
+
+      - name: Dependency security controls
+        # Runs in the scheduled workflow as well, on purpose.
+        #
+        # The controls prove the gate can still FAIL and ERROR, not merely PASS.
+        # If someone weakened the gate — widened the threshold, dropped the
+        # lockfile-shape check, swallowed a spawn failure — a nightly run that
+        # only executed the gate would go on printing PASS forever. Running the
+        # controls here means the nightly job also verifies that its own green
+        # result would mean something.
+        run: node tools/dependency-security-controls.mjs

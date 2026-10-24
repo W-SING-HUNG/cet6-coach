@@ -310,6 +310,10 @@ pnpm release:history            # history shape, filenames, commit identities an
 pnpm release:fingerprints       # no real exam text, with a positive control
 pnpm release:secrets            # the secret scanner fires on synthetic credentials
 pnpm release:bundle             # the emitted client bundle carries no internal directory names
+pnpm release:deps               # resolved dependencies vs. the npm advisory index (fail-closed)
+pnpm release:deps-controls      # the dependency gate really returns PASS, FAIL and ERROR
+pnpm release:workflow           # CI configuration integrity: required checks, pins, permissions
+pnpm release:workflow-controls  # the CI-configuration gate rejects each weakening it claims to catch
 pnpm content:fingerprint-proof  # no real exam text in the tree (positive + negative controls)
 pnpm display-safety-proof       # path sanitiser removes paths and keeps the sentence
 pnpm next:import-safety         # importing scripts/next.mjs has no side effects
